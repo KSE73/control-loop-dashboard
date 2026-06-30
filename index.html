@@ -64,7 +64,7 @@ class Component extends DCLogic {
   state = {
     screen:'overview', team:'', proc:0, modal:null, expanded:{},
     changeType:'all', changeTeam:'all', changeProc:'all', year:2026,
-    adminTab:'master', teamViewMode:'monthly', teamDailyMonth:'',
+    adminTab:'master', teamViewMode:'monthly', teamDailyMonth:'', procViewMode:'monthly', procDailyMonth:'',
     masterUpload:null, masterDragOver:false, masterParseErr:'', masterSaving:false, masterUpTeam:0,
     dailyUpload:null, dailyDragOver:false, dailyParseErr:'', dailySaving:false, dailyUpTeam:0, dailySaveResult:null,
     loading:true, loadError:'', saving:false
@@ -253,7 +253,7 @@ class Component extends DCLogic {
           const rate=calcRate(ds,curMonthDates);
           const prev=calcRate(ds,prevMonthDates);
           const today=heat[heat.length-1]||'NA';
-          return { id:loop.tagId||'—', name:loop.tagName||loop.tagId||'—', en:loop.tagName||'', dcs:loop.dcs||'', rate, prev, heat, today, manDays:heat.filter(c=>c==='MAN').length, code:today };
+          return { id:loop.tagId||'—', name:loop.tagName||loop.tagId||'—', en:loop.tagName||'', dcs:loop.dcs||'', rate, prev, heat, today, manDays:heat.filter(c=>c==='MAN').length, code:today, ds };
         });
         const total=processedTags.length;
         const autoLoop=processedTags.filter(t=>t.today==='AUT').length;
@@ -683,30 +683,78 @@ class Component extends DCLogic {
   scProcess(h,D,T,card,h2,th,td){
     const tm=this.curTeam(); if(!tm) return h('div',null,'팀 데이터 없음');
     const p=tm.processes[this.state.proc]; if(!p) return h('div',null,'공정 데이터 없음');
+    const st=this.state;
+    const viewMode=st.procViewMode||'monthly';
+    const toggleBar=h('div',{style:{display:'flex',gap:'4px',background:'#f1f2f5',borderRadius:'10px',padding:'4px',marginBottom:'20px',width:'fit-content'}},
+      ['monthly','daily'].map((key,i)=>h('div',{key,onClick:()=>this.go({procViewMode:key}),style:{padding:'8px 22px',borderRadius:'7px',fontSize:'13px',fontWeight:600,cursor:'pointer',transition:'all .1s',background:viewMode===key?'#fff':'transparent',color:viewMode===key?'#16161f':'#6b6e77',boxShadow:viewMode===key?'0 1px 3px rgba(0,0,0,.08)':'none'}},i===0?'월별 조회':'일별 조회')));
     const summary=h('div',{style:{display:'flex',gap:'24px',background:'#fff',border:'1px solid #e8eaee',borderRadius:'10px',padding:'15px 22px',marginBottom:'18px',boxShadow:'0 1px 3px rgba(0,0,0,.05)'}},
       [['전체 Loop',p.total,'#16161f'],['Auto',p.autoLoop,'#1890FF'],['MAN',p.total-p.autoLoop,'#FF4D4D'],['Auto율',p.rate+'%',this.rateColor(p.rate)]].map((s,i)=>
         h('div',{key:i,style:{display:'flex',alignItems:'baseline',gap:'8px',borderLeft:i?'1px solid #eceef1':'none',paddingLeft:i?'24px':0}},
           h('span',{style:{fontSize:'12px',color:'#9a9da6',fontWeight:600}},s[0]),
           h('span',{className:'num',style:{fontSize:'20px',fontWeight:800,color:s[2]}},s[1]))));
-    const rows=p.tags.map((t,ti)=>{
-      const last30=t.heat.slice(30);
-      return h('tr',{key:ti,onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},
-        td(h('span',{onClick:()=>this.go({modal:Object.assign({},t,{path:tm.name+' › '+p.name})}),style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6',cursor:'pointer'}},t.id)),
-        td(h('span',null,t.name,t.en&&t.en!==t.name?h('span',{style:{color:'#b0b3ba',marginLeft:'6px',fontSize:'11px'}},t.en):null)),
-        td(t.dcs?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'3px 9px',borderRadius:'5px',background:this.dcsBg(t.dcs),color:this.dcsFg(t.dcs)}},t.dcs):h('span',{style:{color:'#c2c5cc'}},'—')),
-        td(h('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px',fontWeight:600,color:this.statusColor(t.today)}},
-          h('span',{style:{width:'8px',height:'8px',borderRadius:'50%',background:this.statusColor(t.today)}}),this.statusLabel(t.today)),{textAlign:'center'}),
-        td(h('div',{style:{display:'flex',gap:'2px'}},last30.map((c,di)=>h('div',{key:di,title:'D-'+(29-di)+' · '+this.statusLabel(c),style:{width:'9px',height:'15px',borderRadius:'2px',background:this.heatBg(c)}})))),
-        td(h('span',{style:{fontSize:'15px',color:t.today==='AUT'?'#52C41A':'#FF4D4D'}},t.today==='AUT'?'✔':'✘'),{textAlign:'center'}),
-        td(h('span',{style:{fontWeight:700,color:this.rateColor(t.rate)}},t.rate+'%'),{textAlign:'right',fontFamily:'Inter'}));
+    if(viewMode==='monthly'){
+      const rows=p.tags.map((t,ti)=>{
+        const last30=t.heat.slice(-30);
+        return h('tr',{key:ti,onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},
+          td(h('span',{onClick:()=>this.go({modal:Object.assign({},t,{path:tm.name+' › '+p.name})}),style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6',cursor:'pointer'}},t.id)),
+          td(h('span',null,t.name,t.en&&t.en!==t.name?h('span',{style:{color:'#b0b3ba',marginLeft:'6px',fontSize:'11px'}},t.en):null)),
+          td(t.dcs?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'3px 9px',borderRadius:'5px',background:this.dcsBg(t.dcs),color:this.dcsFg(t.dcs)}},t.dcs):h('span',{style:{color:'#c2c5cc'}},'—')),
+          td(h('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px',fontWeight:600,color:this.statusColor(t.today)}},
+            h('span',{style:{width:'8px',height:'8px',borderRadius:'50%',background:this.statusColor(t.today)}}),this.statusLabel(t.today)),{textAlign:'center'}),
+          td(last30.length?h('div',{style:{display:'flex',gap:'2px'}},last30.map((c,di)=>h('div',{key:di,title:'D-'+(last30.length-1-di)+' · '+this.statusLabel(c),style:{width:'9px',height:'15px',borderRadius:'2px',background:this.heatBg(c)}}))):h('span',{style:{color:'#c2c5cc',fontSize:'11px'}},'없음')),
+          td(h('span',{style:{fontSize:'15px',color:t.today==='AUT'?'#52C41A':'#FF4D4D'}},t.today==='AUT'?'✔':'✘'),{textAlign:'center'}),
+          td(h('span',{style:{fontWeight:700,color:this.rateColor(t.rate)}},t.rate+'%'),{textAlign:'right',fontFamily:'Inter'}));
+      });
+      const table=h('div',{style:card({overflow:'hidden',marginBottom:'14px'})},
+        h('table',{style:{width:'100%',borderCollapse:'collapse'}},
+          h('thead',null,h('tr',null,th('Tag ID'),th('Tag Name'),th('DCS'),th('현재 상태','center'),th('최근 30일 히트맵'),th('오늘 Auto','center'),th('당월 Auto율','right'))),
+          h('tbody',null,rows)));
+      const legend=h('div',{style:{display:'flex',gap:'18px',fontSize:'11px',color:'#9a9da6',marginBottom:'4px'}},
+        [['#1890FF','Auto/RCAS'],['#FF4D4D','MAN'],['#d9d9d9','데이터 없음']].map((l,i)=>h('span',{key:i,style:{display:'inline-flex',alignItems:'center',gap:'5px'}},h('span',{style:{width:'10px',height:'10px',borderRadius:'2px',background:l[0]}}),l[1])));
+      return h('div',null,this.pageTitle(h,tm.name+' › '+p.name+' — Loop 목록'),summary,toggleBar,table,legend);
+    }
+    // ── daily view ──
+    const months=D.useMonths||[];
+    const selMonth=st.procDailyMonth||(months.length?months[months.length-1]:'');
+    const monthPills=h('div',{style:{display:'flex',gap:'6px',flexWrap:'wrap',marginBottom:'18px'}},
+      months.map((m,mi)=>{
+        const label=parseInt(m.split('-')[1])+'월';
+        const isActive=m===selMonth;
+        return h('div',{key:mi,onClick:()=>this.go({procDailyMonth:m}),style:{padding:'6px 14px',borderRadius:'20px',fontSize:'12.5px',fontWeight:600,cursor:'pointer',background:isActive?'#16161f':'#fff',color:isActive?'#fff':'#5b5e67',border:'1px solid '+(isActive?'#16161f':'#dfe1e6')}},label);
+      }));
+    const allDates=D.dailyDates||[];
+    const filteredDates=selMonth?allDates.filter(d=>d.startsWith(selMonth)):allDates;
+    const statusBg=s=>['AUT','RCAS'].includes(s)?'#1890FF':(s==='MAN'||s==='0')?'#FF4D4D':'#e5e7eb';
+    const thRow=h('tr',null,[
+      th('Tag ID'), th('Tag Name'),
+      ...filteredDates.map((d,di)=>{const pp=d.split('-');return h('th',{key:di,style:{textAlign:'center',padding:'8px 3px',fontSize:'10.5px',fontWeight:700,color:'#7c7f88',background:'#fafbfc',borderBottom:'1px solid #eceef1',whiteSpace:'nowrap',minWidth:'32px'}},pp.length===3?`${parseInt(pp[1])}/${parseInt(pp[2])}`:d);}),
+      th('Auto율','right')
+    ]);
+    const dailyRows=p.tags.map((t,ti)=>{
+      const ds=t.ds||{};
+      const autoCnt=filteredDates.filter(d=>['AUT','RCAS'].includes(ds[d]||'')).length;
+      const filledCnt=filteredDates.filter(d=>ds[d]&&ds[d]!=='').length;
+      const selRate=filledCnt?Math.round(autoCnt/filledCnt*1000)/10:null;
+      return h('tr',{key:ti,onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},[
+        td(h('span',{onClick:()=>this.go({modal:Object.assign({},t,{path:tm.name+' › '+p.name})}),style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6',cursor:'pointer',whiteSpace:'nowrap'}},t.id)),
+        td(h('span',{style:{whiteSpace:'nowrap'}},t.name)),
+        ...filteredDates.map((date,di)=>{
+          const s=ds[date]||'';
+          return h('td',{key:di,style:{padding:'5px 3px',borderBottom:'1px solid #f1f2f5',textAlign:'center'}},
+            h('div',{title:date+' · '+(s||'없음'),style:{width:'14px',height:'20px',borderRadius:'3px',background:statusBg(s),margin:'0 auto'}}));
+        }),
+        td(selRate!=null?h('span',{style:{fontWeight:700,color:this.rateColor(selRate)}},selRate+'%'):h('span',{style:{color:'#c2c5cc'}},'—'),{textAlign:'right',fontFamily:'Inter',whiteSpace:'nowrap'})
+      ]);
     });
-    const table=h('div',{style:card({overflow:'hidden',marginBottom:'18px'})},
-      h('table',{style:{width:'100%',borderCollapse:'collapse'}},
-        h('thead',null,h('tr',null,th('Tag ID'),th('Tag Name'),th('DCS'),th('현재 상태','center'),th('최근 30일 히트맵'),th('오늘 Auto','center'),th('당월 Auto율','right'))),
-        h('tbody',null,rows)));
-    const legend=h('div',{style:{display:'flex',gap:'18px',fontSize:'11px',color:'#9a9da6',marginBottom:'4px'}},
-      [['#1890FF','Auto'],['#FF4D4D','MAN'],['#d9d9d9','데이터 없음']].map((l,i)=>h('span',{key:i,style:{display:'inline-flex',alignItems:'center',gap:'5px'}},h('span',{style:{width:'10px',height:'10px',borderRadius:'2px',background:l[0]}}),l[1])));
-    return h('div',null,this.pageTitle(h,tm.name+' › '+p.name+' — Loop 목록'),summary,table,legend);
+    const emptyRow=h('tr',null,h('td',{colSpan:filteredDates.length+3,style:{padding:'40px',textAlign:'center',color:'#9a9da6',fontSize:'13px'}},'선택한 기간의 데이터가 없습니다.'));
+    const legend=h('div',{style:{display:'flex',gap:'18px',fontSize:'11px',color:'#9a9da6',marginBottom:'8px'}},
+      [['#1890FF','Auto/RCAS'],['#FF4D4D','MAN'],['#e5e7eb','데이터 없음']].map((l,i)=>h('span',{key:i,style:{display:'inline-flex',alignItems:'center',gap:'5px'}},h('span',{style:{width:'10px',height:'10px',borderRadius:'2px',background:l[0]}}),l[1])));
+    const dailyTable=h('div',{style:card({overflow:'hidden'})},
+      h('div',{style:{overflowX:'auto'}},
+        h('table',{style:{width:'100%',borderCollapse:'collapse',minWidth:'400px'}},
+          h('thead',null,thRow),
+          h('tbody',null,dailyRows.length?dailyRows:[emptyRow]))));
+    return h('div',null,this.pageTitle(h,tm.name+' › '+p.name+' — Loop 목록'),summary,toggleBar,monthPills,legend,dailyTable);
   }
 
   scMonthly(h,D,T,card,h2,th,td){
