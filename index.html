@@ -206,8 +206,10 @@ class Component extends DCLogic {
 
   computeFromLoops(rawLoops){
     if (!rawLoops?.length) return null;
+    // Normalize date keys to YYYY-MM-DD regardless of original separator (- or /)
+    const normalizeDate=d=>{ const p=String(d).split(/[-\/]/); return p.length>=3?`${p[0]}-${p[1].padStart(2,'0')}-${p[2].padStart(2,'0')}`:d; };
     const allDatesSet = new Set();
-    rawLoops.forEach(loop=>loop.dailyStatus && Object.keys(loop.dailyStatus).forEach(d=>allDatesSet.add(d)));
+    rawLoops.forEach(loop=>loop.dailyStatus && Object.keys(loop.dailyStatus).forEach(d=>allDatesSet.add(normalizeDate(d))));
     const sortedDates = [...allDatesSet].sort();
     if (!sortedDates.length) return null;
 
@@ -244,7 +246,9 @@ class Component extends DCLogic {
       const processes=procIds.map(pid=>{
         const tags=teamMap[tid][pid];
         const processedTags=tags.map(loop=>{
-          const ds=loop.dailyStatus||{};
+          // Normalize keys in dailyStatus to YYYY-MM-DD for consistent lookup
+          const rawDs=loop.dailyStatus||{};
+          const ds=Object.fromEntries(Object.entries(rawDs).map(([k,v])=>[normalizeDate(k),v]));
           const heat=last60.map(d=>{ const s=ds[d]; if(!s||s==='') return 'NA'; return ['AUT','RCAS'].includes(s)?'AUT':'MAN'; });
           const rate=calcRate(ds,curMonthDates);
           const prev=calcRate(ds,prevMonthDates);
@@ -270,7 +274,7 @@ class Component extends DCLogic {
         const mDates=sortedDates.filter(d=>d.startsWith(month));
         if(!mDates.length) return 0;
         const allTags=Object.values(teamMap[tid]).flat();
-        const rates=allTags.map(loop=>calcRate(loop.dailyStatus||{},mDates)).filter(r=>r>0);
+        const rates=allTags.map(loop=>calcRate(Object.fromEntries(Object.entries(loop.dailyStatus||{}).map(([k,v])=>[normalizeDate(k),v])),mDates)).filter(r=>r>0);
         return rates.length?Math.round(rates.reduce((a,r)=>a+r,0)/rates.length*10)/10:0;
       });
     });
@@ -284,7 +288,10 @@ class Component extends DCLogic {
       dailyTeam[tid]=Object.keys(teamMap[tid]).sort().map(pid=>{
         const tags=teamMap[tid][pid];
         return last90.map(date=>{
-          const vals=tags.map(loop=>{ const s=(loop.dailyStatus||{})[date]; if(!s||s==='') return null; return ['AUT','RCAS'].includes(s)?100:0; }).filter(v=>v!==null);
+          const vals=tags.map(loop=>{
+            const ds=Object.fromEntries(Object.entries(loop.dailyStatus||{}).map(([k,v])=>[normalizeDate(k),v]));
+            const s=ds[date]; if(!s||s==='') return null; return ['AUT','RCAS'].includes(s)?100:0;
+          }).filter(v=>v!==null);
           return vals.length?Math.round(vals.reduce((a,r)=>a+r,0)/vals.length*10)/10:null;
         });
       });
@@ -293,7 +300,7 @@ class Component extends DCLogic {
     const changeEvents=[];
     if (prevMonth) {
       rawLoops.forEach(loop=>{
-        const ds=loop.dailyStatus||{};
+        const ds=Object.fromEntries(Object.entries(loop.dailyStatus||{}).map(([k,v])=>[normalizeDate(k),v]));
         const dominant=dates=>{ let a=0,m=0; dates.forEach(d=>{ const s=ds[d]; if(!s||s==='') return; ['AUT','RCAS'].includes(s)?a++:['MAN','0'].includes(s)?m++:null; }); return (a||m)?a>=m?'AUT':'MAN':null; };
         const prevMode=dominant(prevMonthDates), curMode=dominant(curMonthDates);
         if(prevMode&&curMode&&prevMode!==curMode){
@@ -303,8 +310,9 @@ class Component extends DCLogic {
       });
     }
 
-    const curMonthLabel = `${parseInt(curMonth.split('-')[1])}월`;
-    const prevMonthLabel = prevMonth ? `${parseInt(prevMonth.split('-')[1])}월` : '';
+    const mNum = s => { const p=(s||'').split(/[-\/]/); const n=parseInt(p[1]); return isNaN(n)?'':n+'월'; };
+    const curMonthLabel = mNum(curMonth);
+    const prevMonthLabel = mNum(prevMonth);
     return { teams, target:90, teamMonthly, overallMonthly, dailyTeam, dailyDates:last90, dailyLabels, changeEvents, monthLabels, teamIds, curMonthLabel, prevMonthLabel };
   }
 
