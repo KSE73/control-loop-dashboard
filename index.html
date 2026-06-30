@@ -303,7 +303,9 @@ class Component extends DCLogic {
       });
     }
 
-    return { teams, target:90, teamMonthly, overallMonthly, dailyTeam, dailyLabels, changeEvents, monthLabels, teamIds };
+    const curMonthLabel = `${parseInt(curMonth.split('-')[1])}월`;
+    const prevMonthLabel = prevMonth ? `${parseInt(prevMonth.split('-')[1])}월` : '';
+    return { teams, target:90, teamMonthly, overallMonthly, dailyTeam, dailyDates:last90, dailyLabels, changeEvents, monthLabels, teamIds, curMonthLabel, prevMonthLabel };
   }
 
   // ===== helpers =====
@@ -367,15 +369,27 @@ class Component extends DCLogic {
     }
     if(sc==='team'){
       const tm=this.curTeam(); if(!tm) return;
+      const dates=D.dailyDates||D.dailyLabels;
+      const tickInterval=Math.max(1, Math.ceil(dates.length/10)-1);
+      const fmtDate=val=>{ const p=String(val).split('-'); return p.length===3?`${parseInt(p[1])}/${parseInt(p[2])}`:val; };
       this.mount('tdLine',{
-        grid:{left:46,right:24,top:26,bottom:40},
+        grid:{left:46,right:24,top:26,bottom:44},
         legend:{top:0,left:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
-        xAxis:{type:'category',data:D.dailyLabels,axisLabel:{color:'#9a9da6',interval:8},axisLine:{lineStyle:{color:grid}}},
+        xAxis:{type:'category',data:dates,
+          axisLabel:{color:'#9a9da6',interval:tickInterval,formatter:fmtDate,rotate:dates.length>60?30:0},
+          axisLine:{lineStyle:{color:grid}},
+          axisTick:{alignWithLabel:true}},
         yAxis:{type:'value',min:0,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
-        tooltip:{trigger:'axis',valueFormatter:v=>v+'%'},
-        dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:6}],
+        tooltip:{trigger:'axis',formatter:params=>{
+          const date=params[0]?.axisValue||'';
+          const p=String(date).split('-');
+          const dateStr=p.length===3?`${p[0]}년 ${parseInt(p[1])}월 ${parseInt(p[2])}일`:date;
+          const lines=params.filter(x=>x.seriesName!=='목표'&&x.value!=null).map(x=>`${x.marker}${x.seriesName}: <b>${x.value}%</b>`);
+          return `<div style="font-size:12px;line-height:1.6"><span style="font-weight:600;color:#3a3a47">${dateStr}</span><br>${lines.join('<br>')}</div>`;
+        }},
+        dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:4}],
         series:tm.processes.map((p,i)=>({name:p.name,type:'line',smooth:true,symbol:'none',data:(D.dailyTeam[tm.id]||[])[i]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
-          .concat([{name:'목표',type:'line',data:D.dailyLabels.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
+          .concat([{name:'목표',type:'line',data:dates.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
       });
     }
     if(sc==='monthly'){
@@ -571,7 +585,7 @@ class Component extends DCLogic {
     });
     const table=h('div',{style:card({overflow:'hidden',marginBottom:'18px'})},
       h('table',{style:{width:'100%',borderCollapse:'collapse'}},
-        h('thead',null,h('tr',null,th('공정명'),th('전체 Loop','right'),th('Auto Loop','right'),th('Auto율','right'),th('전월 Auto율','right'),th('변동(Δ)','right'),th('상태','center'))),
+        h('thead',null,h('tr',null,th('공정명'),th('전체 Loop','right'),th('Auto Loop','right'),th('Auto율 ('+(D.curMonthLabel||'당월')+')','right'),th('전월 ('+(D.prevMonthLabel||'—')+')','right'),th('변동(Δ)','right'),th('상태','center'))),
         h('tbody',null,rows)));
     const chart=h('div',{style:card({padding:'18px 20px'})},h2('공정별 일별 Auto율 추이','최근 90일'),h('div',{id:'tdLine',style:{height:'300px'}}));
     return h('div',null,this.pageTitle(h,tm.name+' — Control Loop Auto율 현황'),table,chart);
