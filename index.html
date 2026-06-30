@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280">
+<title>Control Loop 관리 대시보드</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+*{box-sizing:border-box}
+html,body,#root{height:100%;margin:0}
+body{font-family:'Pretendard',system-ui,sans-serif;color:#2b2b35;background:#eceef1}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#c6cad0;border-radius:6px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-track{background:transparent}
+.num{font-family:'Inter','Pretendard',sans-serif;font-feature-settings:"tnum";font-variant-numeric:tabular-nums}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
+import { getFirestore, collection, getDocs, writeBatch, doc, query, where } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCmLEuMETZ1dHzo8IRT0yTLgrKx4znbNQA",
+  authDomain: "pid-auto.firebaseapp.com",
+  projectId: "pid-auto",
+  storageBucket: "pid-auto.firebasestorage.app",
+  messagingSenderId: "871900847238",
+  appId: "1:871900847238:web:ee73252855f288ac96c507"
+};
+
+const fbApp = initializeApp(firebaseConfig);
+const db = getFirestore(fbApp);
+const fso = { collection, getDocs, writeBatch, doc, query, where };
+
+const React = window.React;
+const ReactDOM = window.ReactDOM;
+const h = React.createElement;
+const COLORS = ['#1890FF','#722ED1','#13C2C2'];
+
+class DCLogic {
+  constructor(props) {
+    this.props = props || {};
+    this.state = {};
+    this.refs = {};
+    this.__host = null;
+  }
+  setState(update, cb) { if (this.__host) this.__host.__setLogicState(update, cb); }
+  forceUpdate() { if (this.__host) this.__host.forceUpdate(); }
+  componentDidMount() {}
+  componentWillUnmount() {}
+  renderVals() { return {}; }
+}
+
+class Component extends DCLogic {
+  state = {
+    screen:'overview', team:'', proc:0, modal:null, expanded:{},
+    changeType:'all', changeTeam:'all', changeProc:'all', year:2026,
+    upload:null, upTeam:0, dragOver:false, regDone:false, parseErr:'',
+    loading:true, loadError:'', saving:false
+  };
+
+  constructor(props){
+    super(props);
+    this._charts = {};
+    this.data = null;
+  }
+
+  // ===== Firestore =====
+  async _loadData(){
+    try {
+      const snap = await fso.getDocs(fso.collection(db, 'loops'));
+      const rawLoops = snap.docs.map(d => d.data());
+      this.data = rawLoops.length ? this.computeFromLoops(rawLoops) : null;
+      const expanded = {};
+      const firstTeam = this.data?.teams[0];
+      if (firstTeam) expanded[firstTeam.id] = true;
+      this.setState({ loading:false, loadError:'', expanded,
+        team: firstTeam?.id || '',
+        screen: this.data ? 'overview' : 'admin' });
+    } catch(e) {
+      console.error('Firestore error:', e);
+      this.setState({ loading:false, loadError: e.message });
+    }
+  }
+
+  async _saveLoops(loops){
+    const teams = [...new Set(loops.map(l=>l.team))];
+    // Fetch existing docs for affected teams to enable merge by (team, tagId)
+    const existingByKey = {};
+    for (const team of teams) {
+      const snap = await fso.getDocs(fso.query(fso.collection(db,'loops'), fso.where('team','==',team)));
+      snap.docs.forEach(d=>{ const dat=d.data(); existingByKey[dat.team+'::'+dat.tagId]={ref:d.ref,dailyStatus:dat.dailyStatus||{}}; });
+    }
+    // Upsert: merge dailyStatus for existing tags, insert for new ones; untouched tags remain unchanged
+    for (let i=0; i<loops.length; i+=499) {
+      const batch = fso.writeBatch(db);
+      loops.slice(i,i+499).forEach(loop=>{
+        const key=loop.team+'::'+loop.tagId;
+        const existing=existingByKey[key];
+        const mergedStatus=existing?{...existing.dailyStatus,...loop.dailyStatus}:loop.dailyStatus;
+        const ref=existing?existing.ref:fso.doc(fso.collection(db,'loops'));
+        batch.set(ref, {...loop, dailyStatus:mergedStatus, updatedAt:new Date().toISOString()});
+      });
+      await batch.commit();
+    }
+  }
+
+  async _registerData(){
+    if (this.state.saving) return;
+    const up = this.state.upload;
+    if (!up) return;
+    this.setState({ saving:true, parseErr:'' });
+    try {
+      const loops = this._extractLoopsFromUpload(up);
+      await this._saveLoops(loops);
+      this.setState({ loading:true });
+      await this._loadData();
+      this.setState({ saving:false, upload:null });
+    } catch(e) {
+      this.setState({ saving:false, parseErr:'Firestore 저장 오류: '+e.message });
+    }
+  }
+
+  _extractLoopsFromUpload(up){
+    const loops = [];
+    up.sheets.forEach(sheet=>{
+      const teamId = sheet.sheet.endsWith('팀') ? sheet.sheet.slice(0,-1) : sheet.sheet;
+      sheet.procs.forEach(proc=>{
+        proc.rows.forEach(row=>{
+          const dailyStatus = {};
+          (row.days||[]).forEach(d=>{ if(d.date && d.status) dailyStatus[d.date]=d.status; });
+          loops.push({ team:teamId, proc:proc.name==='미지정'?'':proc.name, tagId:row.id||'', tagName:row.name||row.id||'', dcs:row.dcs||'', dailyStatus });
+        });
+      });
+    });
+    return loops;
+  }
+
+  computeFromLoops(rawLoops){
+    if (!rawLoops?.length) return null;
+    const allDatesSet = new Set();
+    rawLoops.forEach(loop=>loop.dailyStatus && Object.keys(loop.dailyStatus).forEach(d=>allDatesSet.add(d)));
+    const sortedDates = [...allDatesSet].sort();
+    if (!sortedDates.length) return null;
+
+    const last90 = sortedDates.slice(-90);
+    const last60 = sortedDates.slice(-60);
+    const dailyLabels = last90.map(d=>{ const p=d.split('-'); return `${parseInt(p[1])}/${parseInt(p[2])}`; });
+
+    const allMonths = [...new Set(sortedDates.map(d=>d.slice(0,7)))].sort();
+    const useMonths = allMonths.slice(-12);
+    const monthLabels = useMonths.map(m=>`${parseInt(m.split('-')[1])}월`);
+    const curMonth = allMonths[allMonths.length-1];
+    const prevMonth = allMonths.length>1 ? allMonths[allMonths.length-2] : null;
+    const curMonthDates = sortedDates.filter(d=>d.startsWith(curMonth));
+    const prevMonthDates = prevMonth ? sortedDates.filter(d=>d.startsWith(prevMonth)) : [];
+
+    const calcRate=(ds,dates)=>{
+      if (!dates.length||!ds) return 0;
+      const filled=dates.filter(d=>ds[d]&&ds[d]!=='');
+      if (!filled.length) return 0;
+      return Math.round(filled.filter(d=>['AUT','RCAS'].includes(ds[d])).length/filled.length*1000)/10;
+    };
+
+    const teamMap={};
+    rawLoops.forEach(loop=>{
+      const tid=loop.team||'기타'; const pid=loop.proc||'공정1';
+      if(!teamMap[tid]) teamMap[tid]={};
+      if(!teamMap[tid][pid]) teamMap[tid][pid]=[];
+      teamMap[tid][pid].push(loop);
+    });
+    const teamIds=Object.keys(teamMap).sort();
+
+    const teams=teamIds.map(tid=>{
+      const procIds=Object.keys(teamMap[tid]).sort();
+      const processes=procIds.map(pid=>{
+        const tags=teamMap[tid][pid];
+        const processedTags=tags.map(loop=>{
+          const ds=loop.dailyStatus||{};
+          const heat=last60.map(d=>{ const s=ds[d]; if(!s||s==='') return 'NA'; return ['AUT','RCAS'].includes(s)?'AUT':'MAN'; });
+          const rate=calcRate(ds,curMonthDates);
+          const prev=calcRate(ds,prevMonthDates);
+          const today=heat[heat.length-1]||'NA';
+          return { id:loop.tagId||'—', name:loop.tagName||loop.tagId||'—', en:loop.tagName||'', dcs:loop.dcs||'', rate, prev, heat, today, manDays:heat.filter(c=>c==='MAN').length, code:today };
+        });
+        const total=processedTags.length;
+        const autoLoop=processedTags.filter(t=>t.today==='AUT').length;
+        const rate=total?Math.round(processedTags.reduce((a,t)=>a+t.rate,0)/total*10)/10:0;
+        const prevRate=total?Math.round(processedTags.reduce((a,t)=>a+t.prev,0)/total*10)/10:0;
+        return { name:pid, sub:'', total, autoLoop, rate, prevRate, tags:processedTags };
+      });
+      const total=processes.reduce((a,p)=>a+p.total,0);
+      const al=processes.reduce((a,p)=>a+p.autoLoop,0);
+      const auto=total?Math.round(processes.reduce((a,p)=>a+p.rate*p.total,0)/total*10)/10:0;
+      const prev=total?Math.round(processes.reduce((a,p)=>a+p.prevRate*p.total,0)/total*10)/10:0;
+      return { id:tid, name:tid+'팀', target:90, auto, prev, total, autoLoop:al, processes };
+    });
+
+    const teamMonthly={};
+    teamIds.forEach(tid=>{
+      teamMonthly[tid]=useMonths.map(month=>{
+        const mDates=sortedDates.filter(d=>d.startsWith(month));
+        if(!mDates.length) return 0;
+        const allTags=Object.values(teamMap[tid]).flat();
+        const rates=allTags.map(loop=>calcRate(loop.dailyStatus||{},mDates)).filter(r=>r>0);
+        return rates.length?Math.round(rates.reduce((a,r)=>a+r,0)/rates.length*10)/10:0;
+      });
+    });
+    const overallMonthly=useMonths.map((_,i)=>{
+      const vals=teamIds.map(tid=>teamMonthly[tid][i]).filter(v=>v>0);
+      return vals.length?Math.round(vals.reduce((a,v)=>a+v,0)/vals.length*10)/10:0;
+    });
+
+    const dailyTeam={};
+    teamIds.forEach(tid=>{
+      dailyTeam[tid]=Object.keys(teamMap[tid]).sort().map(pid=>{
+        const tags=teamMap[tid][pid];
+        return last90.map(date=>{
+          const vals=tags.map(loop=>{ const s=(loop.dailyStatus||{})[date]; if(!s||s==='') return null; return ['AUT','RCAS'].includes(s)?100:0; }).filter(v=>v!==null);
+          return vals.length?Math.round(vals.reduce((a,r)=>a+r,0)/vals.length*10)/10:null;
+        });
+      });
+    });
+
+    const changeEvents=[];
+    if (prevMonth) {
+      rawLoops.forEach(loop=>{
+        const ds=loop.dailyStatus||{};
+        const dominant=dates=>{ let a=0,m=0; dates.forEach(d=>{ const s=ds[d]; if(!s||s==='') return; ['AUT','RCAS'].includes(s)?a++:['MAN','0'].includes(s)?m++:null; }); return (a||m)?a>=m?'AUT':'MAN':null; };
+        const prevMode=dominant(prevMonthDates), curMode=dominant(curMonthDates);
+        if(prevMode&&curMode&&prevMode!==curMode){
+          const type=prevMode==='AUT'&&curMode==='MAN'?'down':prevMode==='MAN'&&curMode==='AUT'?'up':null;
+          if(type) changeEvents.push({ id:loop.tagId||'—', name:loop.tagName||'—', team:loop.team||'—', proc:loop.proc||'—', dcs:loop.dcs||'', prev:prevMode, cur:curMode, type });
+        }
+      });
+    }
+
+    return { teams, target:90, teamMonthly, overallMonthly, dailyTeam, dailyLabels, changeEvents, monthLabels, teamIds };
+  }
+
+  // ===== helpers =====
+  T(){ return this.props.targetRate??90; }
+  rateColor(v){ const t=this.T(); if(v>=t) return '#52C41A'; if(v>=t-6) return '#FAAD14'; return '#FF4D4D'; }
+  statusColor(c){ return c==='MAN'?'#FF4D4D':(c==='NA'||c==='-')?'#c2c5cc':'#1890FF'; }
+  statusLabel(c){ return ({AUT:'AUT',RCAS:'RCAS',MAN:'MAN','0':'MAN','-':'-',NA:'-'})[c]||c; }
+  heatBg(c){ return c==='MAN'?'#FF4D4D':c==='NA'?'#d9d9d9':'#1890FF'; }
+  dcsBg(d){ return d==='Honeywell'?'#fdecea':'#e8f3ff'; }
+  dcsFg(d){ return d==='Honeywell'?'#E8390E':'#1677d6'; }
+  delta(cur,prev){ const d=+(cur-prev).toFixed(1); return { d, txt:(d>=0?'+':'')+Math.abs(d)+'%p', color:d>=0?'#52C41A':'#FF4D4D', arrow:d>=0?'▲':'▼' }; }
+  curTeam(){ if(!this.data) return null; return this.data.teams.find(t=>t.id===this.state.team)||this.data.teams[0]||null; }
+  go(patch){ this.setState(patch); }
+
+  // ===== charts =====
+  componentDidMount(){ this._loadData(); }
+
+  scheduleDraw(force){
+    const sig=this.state.screen+'|'+this.state.team+'|'+this.state.year+'|'+this.state.changeType+'|'+this.T();
+    if(!force&&sig===this._sig) return;
+    this._sig=sig;
+    if(!window.echarts){ clearTimeout(this._t); this._t=setTimeout(()=>{ this._sig=null; this.scheduleDraw(true); },120); return; }
+    requestAnimationFrame(()=>requestAnimationFrame(()=>this.renderCharts()));
+  }
+
+  renderCharts(){
+    if(!window.echarts) return;
+    Object.values(this._charts).forEach(c=>{ try{c.dispose();}catch(e){} });
+    this._charts={};
+    try{ this._draw(); }catch(e){ console.error('chart draw error',e); }
+  }
+
+  mount(id,opt){ const dom=document.getElementById(id); if(!dom) return; try{ const ex=echarts.getInstanceByDom(dom); if(ex)ex.dispose(); }catch(e){} const c=echarts.init(dom); c.setOption(opt); this._charts[id]=c; }
+
+  _draw(){
+    const D=this.data; if(!D) return;
+    const T=this.T(), sc=this.state.screen;
+    const grid='#eef0f3', red='#FF4D4D';
+    if(sc==='overview'){
+      const teams=[...D.teams].sort((a,b)=>a.auto-b.auto);
+      this.mount('ovBar',{
+        grid:{left:54,right:60,top:14,bottom:24},
+        xAxis:{type:'value',max:100,min:70,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
+        yAxis:{type:'category',data:teams.map(t=>t.name),axisLabel:{color:'#3a3a47',fontWeight:600,fontSize:13},axisLine:{lineStyle:{color:grid}}},
+        tooltip:{trigger:'axis',valueFormatter:v=>v+'%'},
+        series:[{type:'bar',data:teams.map(t=>({value:t.auto,itemStyle:{color:t.auto>=T?'#52C41A':red,borderRadius:[0,4,4,0]}})),barWidth:22,
+          markLine:{symbol:'none',data:[{xAxis:T}],lineStyle:{color:red,type:'dashed',width:1.5},label:{formatter:'목표 '+T+'%',color:red,fontSize:11,position:'insideEndTop'}},
+          label:{show:true,position:'right',formatter:'{c}%',color:'#3a3a47',fontWeight:600,fontFamily:'Inter'}}]
+      });
+      this.mount('ovTrend',{
+        grid:{left:46,right:24,top:22,bottom:28},
+        legend:{right:0,top:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
+        xAxis:{type:'category',data:D.monthLabels,axisLabel:{color:'#9a9da6'},axisLine:{lineStyle:{color:grid}}},
+        yAxis:{type:'value',min:60,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
+        tooltip:{trigger:'axis',valueFormatter:v=>v+'%'},
+        series:[
+          {name:'전사 Auto율',type:'line',smooth:true,data:D.overallMonthly,lineStyle:{color:'#16161f',width:2.5},itemStyle:{color:'#16161f'},symbol:'circle',symbolSize:6,areaStyle:{color:'rgba(22,22,31,.05)'}},
+          {name:'목표',type:'line',data:D.overallMonthly.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}
+        ]
+      });
+    }
+    if(sc==='team'){
+      const tm=this.curTeam(); if(!tm) return;
+      this.mount('tdLine',{
+        grid:{left:46,right:24,top:26,bottom:40},
+        legend:{top:0,left:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
+        xAxis:{type:'category',data:D.dailyLabels,axisLabel:{color:'#9a9da6',interval:8},axisLine:{lineStyle:{color:grid}}},
+        yAxis:{type:'value',min:0,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
+        tooltip:{trigger:'axis',valueFormatter:v=>v+'%'},
+        dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:6}],
+        series:tm.processes.map((p,i)=>({name:p.name,type:'line',smooth:true,symbol:'none',data:(D.dailyTeam[tm.id]||[])[i]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
+          .concat([{name:'목표',type:'line',data:D.dailyLabels.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
+      });
+    }
+    if(sc==='monthly'){
+      this.mount('moLine',{
+        grid:{left:46,right:24,top:30,bottom:28},
+        legend:{top:0,left:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
+        xAxis:{type:'category',data:D.monthLabels,axisLabel:{color:'#9a9da6'},axisLine:{lineStyle:{color:grid}}},
+        yAxis:{type:'value',min:60,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
+        tooltip:{trigger:'axis',valueFormatter:v=>v+'%'},
+        series:D.teamIds.map((k,i)=>({name:k+'팀',type:'line',smooth:true,symbol:'circle',symbolSize:5,data:D.teamMonthly[k]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
+          .concat([{name:'목표',type:'line',data:D.overallMonthly.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
+      });
+    }
+    if(sc==='change'){
+      const cnt={}; D.teams.forEach(t=>cnt[t.id]={down:0,up:0});
+      D.changeEvents.forEach(e=>{ if(cnt[e.team]) cnt[e.team][e.type]++; });
+      this.mount('chBar',{
+        grid:{left:40,right:16,top:24,bottom:24},
+        legend:{top:0,right:0,itemWidth:12,itemHeight:12,textStyle:{fontSize:11,color:'#6b6e77'}},
+        xAxis:{type:'category',data:D.teams.map(t=>t.name),axisLabel:{color:'#3a3a47',fontWeight:600},axisLine:{lineStyle:{color:grid}}},
+        yAxis:{type:'value',axisLabel:{color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
+        tooltip:{trigger:'axis'},
+        series:[
+          {name:'Auto→MAN',type:'bar',stack:'x',data:D.teams.map(t=>cnt[t.id]?.down||0),itemStyle:{color:red,borderRadius:[0,0,3,3]},barWidth:30},
+          {name:'MAN→Auto',type:'bar',stack:'x',data:D.teams.map(t=>cnt[t.id]?.up||0),itemStyle:{color:'#52C41A',borderRadius:[3,3,0,0]},barWidth:30}
+        ]
+      });
+    }
+  }
+
+  // ===== nav =====
+  navItem(key){
+    const active=this.state.screen===key;
+    return { active, onClick:()=>this.go({screen:key,modal:null}),
+      fg:active?'#16161f':'#5b5e67', bg:active?'#fff':'transparent',
+      border:active?(this.props.accent??'#E8390E'):'transparent' };
+  }
+
+  renderVals(){
+    const D=this.data, st=this.state, accent=this.props.accent??'#E8390E', T=this.T();
+    if(D) this.scheduleDraw(false);
+    const alertTeams=D?D.teams.filter(t=>t.auto<T):[];
+
+    const sideTeams=D?D.teams.map(t=>{
+      const open=!!st.expanded[t.id], isActive=st.screen==='team'&&st.team===t.id;
+      return { name:t.name, rate:t.auto, open, caret:open?'rotate(90deg)':'rotate(0deg)',
+        dot:this.rateColor(t.auto), weight:isActive?700:600,
+        fg:isActive?'#16161f':'#3a3a47', bg:isActive?'#fff':'transparent', border:isActive?accent:'transparent',
+        onToggle:()=>this.setState(s=>({screen:'team',team:t.id,modal:null,expanded:{...s.expanded,[t.id]:true}})),
+        procs:t.processes.map((p,pi)=>{
+          const pa=st.screen==='process'&&st.team===t.id&&st.proc===pi;
+          return { name:p.name, rate:p.rate, rateColor:this.rateColor(p.rate),
+            fg:pa?'#16161f':'#6b6e77', bg:pa?'#eef0f3':'transparent',
+            onClick:()=>this.setState(s=>({screen:'process',team:t.id,proc:pi,modal:null,expanded:{...s.expanded,[t.id]:true}})) };
+        })
+      };
+    }):[];
+
+    const tm=D?this.curTeam():null;
+    let crumbList=[{label:'관리자 설정'}];
+    if(D){
+      if(st.screen==='overview') crumbList=[{label:'전사 Overview'}];
+      else if(st.screen==='team') crumbList=[{label:'전사'},{label:tm?.name||''}];
+      else if(st.screen==='process') crumbList=[{label:'전사'},{label:tm?.name||''},{label:tm?.processes[st.proc]?.name||''}];
+      else if(st.screen==='monthly') crumbList=[{label:'월별 요약'}];
+      else if(st.screen==='change') crumbList=[{label:'전월 대비 변동 분석'}];
+    }
+    const crumbs=crumbList.map((c,i)=>({label:c.label,color:i===crumbList.length-1?'#16161f':'#8b8e97',weight:i===crumbList.length-1?700:500,sep:i<crumbList.length-1?'›':''}));
+
+    let banner={show:false};
+    if(D&&(st.screen==='overview'||st.screen==='team')&&alertTeams.length){
+      const names=alertTeams.map(t=>t.name+' '+t.auto+'%').join(', ');
+      banner={show:true,bg:'#fff8e6',bd:'#ffe1a8',accent:'#FAAD14',fg:'#8a5a00',icon:'⚠️',
+        text:'목표 Auto율('+T+'%) 미달 팀 '+alertTeams.length+'개 — '+names+'. 변동 분석에서 MAN 전환 Tag를 확인하세요.'};
+    }
+
+    let modal={open:false};
+    if(st.modal){
+      const m=st.modal, d=this.delta(m.rate,m.prev);
+      modal={ open:true, id:m.id, name:m.name+(m.en&&m.en!==m.name?' ('+m.en+')':''), path:m.path, dcs:m.dcs,
+        dcsBg:this.dcsBg(m.dcs), dcsFg:this.dcsFg(m.dcs), statusCode:this.statusLabel(m.code),
+        stBg:this.statusColor(m.code)+'1a', stFg:this.statusColor(m.code),
+        rate:m.rate, rateColor:this.rateColor(m.rate), deltaArrow:d.arrow, deltaTxt:d.txt, deltaColor:d.color, manDays:m.manDays,
+        heat:m.heat.map((c,i)=>({bg:this.heatBg(c),title:'D-'+(59-i)+' · '+this.statusLabel(c)})),
+        onClose:()=>this.go({modal:null}), stop:(e)=>e.stopPropagation() };
+    }
+
+    return {
+      accent, alertCount:D?D.changeEvents.filter(e=>e.type==='down').length:0,
+      nav:{ overview:this.navItem('overview'), monthly:this.navItem('monthly'), change:this.navItem('change'), admin:this.navItem('admin') },
+      sideTeams, crumbs, banner, modal,
+      screenRef:(el)=>{ this.refs=this.refs||{}; this.refs.screenRef=el; },
+      screenView:this.buildScreen(),
+    };
+  }
+
+  buildScreen(){
+    const h=React.createElement, st=this.state, D=this.data, T=this.T(), accent=this.props.accent??'#E8390E';
+    const card=(extra)=>Object.assign({background:'#fff',border:'1px solid #e8eaee',borderRadius:'10px',boxShadow:'0 1px 3px rgba(0,0,0,.05)'},extra||{});
+    const h2=(t,sub)=>h('div',{style:{display:'flex',alignItems:'baseline',gap:'10px',marginBottom:'14px'}},
+      h('span',{style:{fontSize:'15px',fontWeight:700,color:'#16161f'}},t),
+      sub?h('span',{style:{fontSize:'12px',color:'#9a9da6'}},sub):null);
+    const th=(t,al)=>h('th',{style:{textAlign:al||'left',padding:'11px 14px',fontSize:'11.5px',fontWeight:700,color:'#7c7f88',background:'#fafbfc',borderBottom:'1px solid #eceef1',whiteSpace:'nowrap'}},t);
+    const td=(c,extra)=>h('td',{style:Object.assign({padding:'11px 14px',fontSize:'13px',color:'#2b2b35',borderBottom:'1px solid #f1f2f5'},extra||{})},c);
+    if(!D){
+      if(st.screen==='admin') return this.scAdmin(h,card,h2);
+      return h('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',height:'60vh',flexDirection:'column',gap:'14px',color:'#9a9da6'}},
+        h('div',{style:{fontSize:'32px'}},'📂'),
+        h('div',{style:{fontSize:'15px',fontWeight:600,color:'#3a3a47'}},'Firestore에 데이터가 없습니다'),
+        h('div',{style:{fontSize:'13px'}},'관리자 설정에서 Excel 파일을 업로드하세요.'));
+    }
+    if(st.screen==='overview') return this.scOverview(h,D,T,card,h2,th,td);
+    if(st.screen==='team') return this.scTeam(h,D,T,card,h2,th,td);
+    if(st.screen==='process') return this.scProcess(h,D,T,card,h2,th,td);
+    if(st.screen==='monthly') return this.scMonthly(h,D,T,card,h2,th,td);
+    if(st.screen==='change') return this.scChange(h,D,T,card,h2,th,td,accent);
+    return this.scAdmin(h,card,h2);
+  }
+
+  pageTitle(h,t,right){ return h('div',{style:{display:'flex',alignItems:'flex-end',justifyContent:'space-between',marginBottom:'18px'}},
+    h('h1',{style:{margin:0,fontSize:'20px',fontWeight:800,color:'#16161f',letterSpacing:'-.4px'}},t),right||null); }
+
+  filterBar(h){
+    const sel=(label,opts)=>h('div',{style:{display:'flex',flexDirection:'column',gap:'4px'}},
+      h('span',{style:{fontSize:'10.5px',color:'#9a9da6',fontWeight:600}},label),
+      h('select',{style:{border:'1px solid #dfe1e6',borderRadius:'7px',padding:'7px 26px 7px 11px',fontSize:'12.5px',fontFamily:'inherit',color:'#3a3a47',background:'#fff',cursor:'pointer'}},
+        opts.map((o,i)=>h('option',{key:i},o))));
+    return h('div',{style:{display:'flex',gap:'14px',alignItems:'flex-end',background:'#fff',border:'1px solid #e8eaee',borderRadius:'10px',padding:'14px 18px',marginBottom:'18px',boxShadow:'0 1px 3px rgba(0,0,0,.05)'}},
+      sel('조회 기간',['월별','주별','일별']),
+      sel('기준 월',['당월','전월','3개월 전']),
+      h('div',{style:{flex:1}}),
+      h('button',{style:{border:'none',background:'#16161f',color:'#fff',padding:'8px 18px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600,cursor:'pointer',fontFamily:'inherit'}},'조회'));
+  }
+
+  scOverview(h,D,T,card,h2,th,td){
+    const overall=+(D.teams.reduce((a,t)=>a+t.auto*t.total,0)/Math.max(1,D.teams.reduce((a,t)=>a+t.total,0))).toFixed(1);
+    const prevOverall=+(D.teams.reduce((a,t)=>a+t.prev*t.total,0)/Math.max(1,D.teams.reduce((a,t)=>a+t.total,0))).toFixed(1);
+    const od=this.delta(overall,prevOverall);
+    const totalLoop=D.teams.reduce((a,t)=>a+t.total,0), autoLoop=D.teams.reduce((a,t)=>a+t.autoLoop,0);
+    const manCnt=D.changeEvents.filter(e=>e.type==='down').length;
+    const achieved=D.teams.filter(t=>t.auto>=T).length;
+    const kpis=[
+      {label:'전사 Auto율',value:overall+'%',sub:'전월 '+prevOverall+'%',d:od},
+      {label:'Auto 인정 Loop',value:autoLoop.toLocaleString(),sub:'전체 '+totalLoop.toLocaleString()+' Loop',d:{arrow:'',txt:'',color:'#1890FF'},accent:'#1890FF'},
+      {label:'MAN 전환 Tag (당월)',value:manCnt+'건',sub:'운전 조치 필요',d:{arrow:'▼',txt:'주의',color:'#FF4D4D'},accent:'#FF4D4D'},
+      {label:'목표 달성 팀',value:achieved+' / '+D.teams.length,sub:'목표 '+T+'% 기준',d:{arrow:'',txt:'',color:'#52C41A'},accent:'#52C41A'},
+    ];
+    const kpiCards=h('div',{style:{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:'16px',marginBottom:'18px'}},
+      kpis.map((k,i)=>h('div',{key:i,style:card({padding:'18px 20px'})},
+        h('div',{style:{fontSize:'12px',color:'#7c7f88',fontWeight:600,marginBottom:'10px'}},k.label),
+        h('div',{style:{display:'flex',alignItems:'baseline',gap:'8px'}},
+          h('span',{className:'num',style:{fontSize:'32px',fontWeight:800,color:k.accent||'#16161f',letterSpacing:'-1px'}},k.value),
+          k.d.txt?h('span',{style:{fontSize:'12.5px',fontWeight:700,color:k.d.color}},k.d.arrow+' '+k.d.txt):null),
+        h('div',{style:{fontSize:'11.5px',color:'#9a9da6',marginTop:'7px'}},k.sub))));
+    const sorted=[...D.teams].sort((a,b)=>b.auto-a.auto);
+    const ranks=sorted.map(t=>{ const d=this.delta(t.auto,t.prev); return {name:t.name,auto:t.auto,d}; })
+      .sort((a,b)=>Math.abs(b.d.d)-Math.abs(a.d.d)).slice(0,3);
+    const mid=h('div',{style:{display:'grid',gridTemplateColumns:'1.5fr 1fr',gap:'16px',marginBottom:'18px'}},
+      h('div',{style:card({padding:'18px 20px'})},h2('팀별 Auto율','목표 '+T+'% 대비'),h('div',{id:'ovBar',style:{height:'250px'}})),
+      h('div',{style:card({padding:'18px 20px',display:'flex',flexDirection:'column'})},h2('이번 달 변동 현황'),
+        h('div',{style:{display:'flex',gap:'12px',marginBottom:'16px'}},
+          h('div',{style:{flex:1,background:'#fdecec',borderRadius:'8px',padding:'13px 14px'}},
+            h('div',{style:{fontSize:'11px',color:'#c0392b',fontWeight:600,marginBottom:'5px'}},'▼ Auto→MAN 전환'),
+            h('div',{className:'num',style:{fontSize:'26px',fontWeight:800,color:'#FF4D4D'}},D.changeEvents.filter(e=>e.type==='down').length,h('span',{style:{fontSize:'14px',marginLeft:'2px'}},'건'))),
+          h('div',{style:{flex:1,background:'#eaf7ea',borderRadius:'8px',padding:'13px 14px'}},
+            h('div',{style:{fontSize:'11px',color:'#2e7d32',fontWeight:600,marginBottom:'5px'}},'▲ MAN→Auto 복귀'),
+            h('div',{className:'num',style:{fontSize:'26px',fontWeight:800,color:'#52C41A'}},D.changeEvents.filter(e=>e.type==='up').length,h('span',{style:{fontSize:'14px',marginLeft:'2px'}},'건')))),
+        h('div',{style:{fontSize:'12px',fontWeight:700,color:'#7c7f88',marginBottom:'9px'}},'팀별 변동 Top'),
+        h('div',{style:{display:'flex',flexDirection:'column',gap:'2px'}},
+          ranks.map((r,i)=>h('div',{key:i,style:{display:'flex',alignItems:'center',gap:'10px',padding:'9px 4px',borderBottom:i<ranks.length-1?'1px solid #f1f2f5':'none'}},
+            h('span',{className:'num',style:{width:'18px',fontSize:'12px',color:'#b0b3ba',fontWeight:700}},i+1),
+            h('span',{style:{flex:1,fontSize:'13px',fontWeight:600,color:'#3a3a47'}},r.name),
+            h('span',{className:'num',style:{fontSize:'13px',color:'#6b6e77'}},r.auto+'%'),
+            h('span',{style:{fontSize:'12px',fontWeight:700,color:r.d.color,minWidth:'58px',textAlign:'right'}},r.d.arrow+' '+r.d.txt))))));
+    const bottom=h('div',{style:card({padding:'18px 20px'})},h2('월별 전사 Auto율 추이'),h('div',{id:'ovTrend',style:{height:'230px'}}));
+    return h('div',null,this.pageTitle(h,'전사 Overview'),this.filterBar(h),kpiCards,mid,bottom);
+  }
+
+  scTeam(h,D,T,card,h2,th,td){
+    const tm=this.curTeam(); if(!tm) return h('div',null,'팀 데이터 없음');
+    const rows=tm.processes.map((p,pi)=>{
+      const d=this.delta(p.rate,p.prevRate); const ok=p.rate>=T;
+      return h('tr',{key:pi,onClick:()=>this.go({screen:'process',team:tm.id,proc:pi}),style:{cursor:'pointer'},
+        onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},
+        td(h('div',null,h('div',{style:{fontWeight:600,color:'#16161f'}},p.name),p.sub?h('div',{style:{fontSize:'11px',color:'#9a9da6',marginTop:'2px'}},p.sub):null)),
+        td(p.total.toLocaleString(),{textAlign:'right',fontFamily:'Inter'}),
+        td(p.autoLoop.toLocaleString(),{textAlign:'right',fontFamily:'Inter'}),
+        td(h('span',{style:{fontWeight:700,color:this.rateColor(p.rate)}},p.rate+'%'),{textAlign:'right',fontFamily:'Inter'}),
+        td(p.prevRate+'%',{textAlign:'right',fontFamily:'Inter',color:'#9a9da6'}),
+        td(h('span',{style:{fontWeight:700,color:d.color}},d.arrow+' '+d.txt),{textAlign:'right',fontFamily:'Inter'}),
+        td(h('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px',fontSize:'12px',fontWeight:600,color:ok?'#2e7d32':'#c0392b'}},
+          h('span',{style:{width:'8px',height:'8px',borderRadius:'50%',background:ok?'#52C41A':'#FF4D4D'}}),ok?'달성':'미달'),{textAlign:'center'}));
+    });
+    const table=h('div',{style:card({overflow:'hidden',marginBottom:'18px'})},
+      h('table',{style:{width:'100%',borderCollapse:'collapse'}},
+        h('thead',null,h('tr',null,th('공정명'),th('전체 Loop','right'),th('Auto Loop','right'),th('Auto율','right'),th('전월 Auto율','right'),th('변동(Δ)','right'),th('상태','center'))),
+        h('tbody',null,rows)));
+    const chart=h('div',{style:card({padding:'18px 20px'})},h2('공정별 일별 Auto율 추이','최근 90일'),h('div',{id:'tdLine',style:{height:'300px'}}));
+    return h('div',null,this.pageTitle(h,tm.name+' — Control Loop Auto율 현황'),table,chart);
+  }
+
+  scProcess(h,D,T,card,h2,th,td){
+    const tm=this.curTeam(); if(!tm) return h('div',null,'팀 데이터 없음');
+    const p=tm.processes[this.state.proc]; if(!p) return h('div',null,'공정 데이터 없음');
+    const summary=h('div',{style:{display:'flex',gap:'24px',background:'#fff',border:'1px solid #e8eaee',borderRadius:'10px',padding:'15px 22px',marginBottom:'18px',boxShadow:'0 1px 3px rgba(0,0,0,.05)'}},
+      [['전체 Loop',p.total,'#16161f'],['Auto',p.autoLoop,'#1890FF'],['MAN',p.total-p.autoLoop,'#FF4D4D'],['Auto율',p.rate+'%',this.rateColor(p.rate)]].map((s,i)=>
+        h('div',{key:i,style:{display:'flex',alignItems:'baseline',gap:'8px',borderLeft:i?'1px solid #eceef1':'none',paddingLeft:i?'24px':0}},
+          h('span',{style:{fontSize:'12px',color:'#9a9da6',fontWeight:600}},s[0]),
+          h('span',{className:'num',style:{fontSize:'20px',fontWeight:800,color:s[2]}},s[1]))));
+    const rows=p.tags.map((t,ti)=>{
+      const last30=t.heat.slice(30);
+      return h('tr',{key:ti,onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},
+        td(h('span',{onClick:()=>this.go({modal:Object.assign({},t,{path:tm.name+' › '+p.name})}),style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6',cursor:'pointer'}},t.id)),
+        td(h('span',null,t.name,t.en&&t.en!==t.name?h('span',{style:{color:'#b0b3ba',marginLeft:'6px',fontSize:'11px'}},t.en):null)),
+        td(t.dcs?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'3px 9px',borderRadius:'5px',background:this.dcsBg(t.dcs),color:this.dcsFg(t.dcs)}},t.dcs):h('span',{style:{color:'#c2c5cc'}},'—')),
+        td(h('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px',fontWeight:600,color:this.statusColor(t.today)}},
+          h('span',{style:{width:'8px',height:'8px',borderRadius:'50%',background:this.statusColor(t.today)}}),this.statusLabel(t.today)),{textAlign:'center'}),
+        td(h('div',{style:{display:'flex',gap:'2px'}},last30.map((c,di)=>h('div',{key:di,title:'D-'+(29-di)+' · '+this.statusLabel(c),style:{width:'9px',height:'15px',borderRadius:'2px',background:this.heatBg(c)}})))),
+        td(h('span',{style:{fontSize:'15px',color:t.today==='AUT'?'#52C41A':'#FF4D4D'}},t.today==='AUT'?'✔':'✘'),{textAlign:'center'}),
+        td(h('span',{style:{fontWeight:700,color:this.rateColor(t.rate)}},t.rate+'%'),{textAlign:'right',fontFamily:'Inter'}));
+    });
+    const table=h('div',{style:card({overflow:'hidden',marginBottom:'18px'})},
+      h('table',{style:{width:'100%',borderCollapse:'collapse'}},
+        h('thead',null,h('tr',null,th('Tag ID'),th('Tag Name'),th('DCS'),th('현재 상태','center'),th('최근 30일 히트맵'),th('오늘 Auto','center'),th('당월 Auto율','right'))),
+        h('tbody',null,rows)));
+    const legend=h('div',{style:{display:'flex',gap:'18px',fontSize:'11px',color:'#9a9da6',marginBottom:'4px'}},
+      [['#1890FF','Auto'],['#FF4D4D','MAN'],['#d9d9d9','데이터 없음']].map((l,i)=>h('span',{key:i,style:{display:'inline-flex',alignItems:'center',gap:'5px'}},h('span',{style:{width:'10px',height:'10px',borderRadius:'2px',background:l[0]}}),l[1])));
+    return h('div',null,this.pageTitle(h,tm.name+' › '+p.name+' — Loop 목록'),summary,table,legend);
+  }
+
+  scMonthly(h,D,T,card,h2,th,td){
+    const heatBg=(v)=>v>=92?'#b7eb8f':v>=90?'#d9f7be':v>=87?'#fff1b8':v>=84?'#ffd591':'#ffc4be';
+    const months=D.monthLabels||[];
+    const headRow=h('tr',null,th('팀 \\ 월'),months.map((m,i)=>h('th',{key:i,style:{textAlign:'center',padding:'10px 6px',fontSize:'11.5px',fontWeight:700,color:'#7c7f88',background:'#fafbfc',borderBottom:'1px solid #eceef1'}},m)));
+    const bodyRows=D.teams.map(t=>h('tr',{key:t.id},
+      td(h('span',{style:{fontWeight:700,color:'#16161f'}},t.name),{whiteSpace:'nowrap'}),
+      (D.teamMonthly[t.id]||[]).map((v,i)=>h('td',{key:i,style:{padding:'4px',borderBottom:'1px solid #f1f2f5',textAlign:'center'}},
+        h('div',{style:{background:heatBg(v),borderRadius:'5px',padding:'9px 4px',fontSize:'12px',fontWeight:600,fontFamily:'Inter',color:'#2b3a1f'}},v+'%')))));
+    const exportBtn=h('button',{style:{display:'inline-flex',alignItems:'center',gap:'7px',border:'1px solid #1c7a43',background:'#fff',color:'#1c7a43',padding:'8px 16px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600,cursor:'pointer',fontFamily:'inherit'}},
+      h('svg',{width:14,height:14,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2},h('path',{d:'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4'}),h('polyline',{points:'7 10 12 15 17 10'}),h('line',{x1:12,y1:15,x2:12,y2:3})),'Excel 내보내기');
+    const lineCard=h('div',{style:card({padding:'18px 20px',marginBottom:'18px'})},h2('연간 월별 추이','팀별 · 목표 '+T+'%'),h('div',{id:'moLine',style:{height:'280px'}}));
+    const heatCard=h('div',{style:card({overflow:'hidden'})},
+      h('div',{style:{padding:'16px 20px 6px'}},h2('월별 팀별 Auto율 히트맵','셀 색상 = Auto율 수준')),
+      h('div',{style:{overflowX:'auto',padding:'0 8px 12px'}},h('table',{style:{width:'100%',borderCollapse:'collapse'}},h('thead',null,headRow),h('tbody',null,bodyRows))));
+    return h('div',null,this.pageTitle(h,'월별 Auto율 요약',exportBtn),lineCard,heatCard);
+  }
+
+  scChange(h,D,T,card,h2,th,td,accent){
+    const st=this.state;
+    const teamOpts=[['all','전체 팀']].concat(D.teams.map(t=>[t.id,t.name]));
+    const procOpts=[['all','전체 공정']].concat([...new Set(D.changeEvents.map(e=>e.proc).filter(Boolean))].sort().map(p=>[p,p]));
+    const inScope=D.changeEvents.filter(e=>(st.changeTeam==='all'||e.team===st.changeTeam)&&(st.changeProc==='all'||e.proc===st.changeProc));
+    const ev=inScope.filter(e=>st.changeType==='all'||st.changeType===e.type);
+    const down=inScope.filter(e=>e.type==='down').length, up=inScope.filter(e=>e.type==='up').length;
+    const cards=h('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'16px',marginBottom:'18px'}},
+      h('div',{style:card({padding:'20px 24px',borderLeft:'4px solid #FF4D4D',display:'flex',justifyContent:'space-between',alignItems:'center'})},
+        h('div',null,h('div',{style:{fontSize:'13px',color:'#c0392b',fontWeight:600,marginBottom:'8px'}},'▼ Auto → MAN 전환 (저하)'),h('div',{style:{fontSize:'12px',color:'#9a9da6'}},'운전 안정화 조치 필요')),
+        h('div',{className:'num',style:{fontSize:'40px',fontWeight:800,color:'#FF4D4D'}},down,h('span',{style:{fontSize:'18px',marginLeft:'3px'}},'건'))),
+      h('div',{style:card({padding:'20px 24px',borderLeft:'4px solid #52C41A',display:'flex',justifyContent:'space-between',alignItems:'center'})},
+        h('div',null,h('div',{style:{fontSize:'13px',color:'#2e7d32',fontWeight:600,marginBottom:'8px'}},'▲ MAN → Auto 복귀 (개선)'),h('div',{style:{fontSize:'12px',color:'#9a9da6'}},'정상 운전 복귀 확인')),
+        h('div',{className:'num',style:{fontSize:'40px',fontWeight:800,color:'#52C41A'}},up,h('span',{style:{fontSize:'18px',marginLeft:'3px'}},'건'))));
+    const tab=(key,label)=>h('div',{onClick:()=>this.go({changeType:key}),style:{padding:'7px 15px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600,cursor:'pointer',whiteSpace:'nowrap',background:st.changeType===key?'#16161f':'#fff',color:st.changeType===key?'#fff':'#5b5e67',border:'1px solid '+(st.changeType===key?'#16161f':'#dfe1e6')}},label);
+    const drop=(label,val,onCh,opts)=>h('div',{style:{display:'flex',flexDirection:'column',gap:'4px'}},
+      h('span',{style:{fontSize:'10.5px',color:'#9a9da6',fontWeight:600}},label),
+      h('select',{value:val,onChange:e=>onCh(e.target.value),style:{border:'1px solid #dfe1e6',borderRadius:'7px',padding:'7px 11px',fontSize:'12.5px',fontFamily:'inherit',color:'#3a3a47',background:'#fff',cursor:'pointer',minWidth:'104px'}},
+        opts.map((o,i)=>h('option',{key:i,value:o[0]},o[1]))));
+    const anyFilter=st.changeTeam!=='all'||st.changeProc!=='all'||st.changeType!=='all';
+    const filters=h('div',{style:{display:'flex',gap:'16px',alignItems:'flex-end',background:'#fff',border:'1px solid #e8eaee',borderRadius:'10px',padding:'14px 18px',marginBottom:'18px',boxShadow:'0 1px 3px rgba(0,0,0,.05)'}},
+      drop('팀',st.changeTeam,v=>this.go({changeTeam:v}),teamOpts),
+      drop('공정',st.changeProc,v=>this.go({changeProc:v}),procOpts),
+      h('div',{style:{width:'1px',alignSelf:'stretch',background:'#eceef1',margin:'2px 2px'}}),
+      h('div',{style:{display:'flex',flexDirection:'column',gap:'4px'}},
+        h('span',{style:{fontSize:'10.5px',color:'#9a9da6',fontWeight:600}},'변동 유형'),
+        h('div',{style:{display:'flex',gap:'7px'}},tab('all','전체'),tab('down','Auto→MAN'),tab('up','MAN→Auto'))),
+      h('div',{style:{flex:1}}),
+      h('div',{style:{fontSize:'12px',color:'#7c7f88',marginBottom:'7px'}},'결과 ',h('span',{className:'num',style:{fontWeight:700,color:'#16161f'}},ev.length),'건'),
+      anyFilter?h('button',{onClick:()=>this.go({changeTeam:'all',changeProc:'all',changeType:'all'}),style:{border:'1px solid #dfe1e6',background:'#fff',color:'#5b5e67',padding:'7px 14px',borderRadius:'7px',fontSize:'12px',fontWeight:600,cursor:'pointer',fontFamily:'inherit'}},'필터 초기화'):null);
+    const rows=ev.map((e,i)=>{
+      const isDown=e.type==='down';
+      return h('tr',{key:i,onMouseEnter:ex=>ex.currentTarget.style.background='#f8fafd',onMouseLeave:ex=>ex.currentTarget.style.background=''},
+        td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6'}},e.id)),
+        td(e.name,{color:'#6b6e77'}), td(e.team+'팀'), td(e.proc),
+        td(e.dcs?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'3px 9px',borderRadius:'5px',background:this.dcsBg(e.dcs),color:this.dcsFg(e.dcs)}},e.dcs):h('span',{style:{color:'#c2c5cc'}},'—')),
+        td(h('span',{style:{fontWeight:600,color:'#9a9da6'}},e.prev),{textAlign:'center'}),
+        td(h('span',{style:{fontWeight:700,color:this.statusColor(e.cur)}},e.cur),{textAlign:'center'}),
+        td(h('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px',fontSize:'12px',fontWeight:700,padding:'4px 10px',borderRadius:'6px',background:isDown?'#fdecec':'#eaf7ea',color:isDown?'#c0392b':'#2e7d32'}},isDown?'▼ 저하':'▲ 개선'),{textAlign:'center'}),
+        td(isDown?h('span',{style:{fontSize:'12px',fontWeight:600,color:accent,cursor:'pointer',textDecoration:'underline',textUnderlineOffset:'2px'}},'코멘트 입력'):h('span',{style:{color:'#c2c5cc'}},'—')));
+    });
+    const emptyRow=h('tr',null,h('td',{colSpan:9,style:{padding:'46px 14px',textAlign:'center',color:'#9a9da6',fontSize:'13px'}},
+      h('div',{style:{fontSize:'22px',marginBottom:'6px',color:'#c2c5cc'}},'—'),'선택한 조건에 해당하는 변동 Tag가 없습니다.'));
+    const table=h('div',{style:card({overflow:'hidden',marginBottom:'18px'})},
+      h('table',{style:{width:'100%',borderCollapse:'collapse'}},
+        h('thead',null,h('tr',null,th('Tag ID'),th('Tag Name'),th('팀'),th('공정'),th('DCS'),th('전월 상태','center'),th('당월 상태','center'),th('변동 유형','center'),th('코멘트'))),
+        h('tbody',null,ev.length?rows:emptyRow)));
+    const barCard=h('div',{style:card({padding:'18px 20px'})},h2('팀별 변동 건수'),h('div',{id:'chBar',style:{height:'220px'}}));
+    return h('div',null,this.pageTitle(h,'전월 대비 변동 분석'),cards,filters,table,barCard);
+  }
+
+  // ===== Excel 업로드/다운로드 =====
+  get VALID_DCS(){ return ['Yokogawa','Honeywell']; }
+  get VALID_STATUS(){ return ['AUT','RCAS','MAN','0','1','2']; }
+  monthDates(){ const a=[]; const now=new Date(); const y=now.getFullYear(), m=String(now.getMonth()+1).padStart(2,'0'); const days=new Date(y,now.getMonth()+1,0).getDate(); for(let d=1;d<=days;d++) a.push(y+'-'+m+'-'+String(d).padStart(2,'0')); return a; }
+
+  downloadTemplate(){
+    const X=window.XLSX; if(!X){ this.setState({parseErr:'엑셀 모듈 로딩 중입니다. 잠시 후 다시 시도하세요.'}); return; }
+    const wb=X.utils.book_new();
+    const dates=this.monthDates();
+    const header=['공정','Tag ID','Tag Name','DCS'].concat(dates);
+    const series=(seed)=>dates.map((_,i)=>((i+seed)%7===4)?'MAN':((i+seed)%11===0?'RCAS':'AUT'));
+    const mk=(p,id,nm,dcs,seed)=>[p,id,nm,dcs].concat(series(seed));
+    const data={
+      'A팀':[mk('공정1','FIC-1001','Feed Flow','Yokogawa',0),mk('공정1','TIC-1008','Temp Ctrl','Honeywell',2),mk('공정2','PIC-2003','Press Ctrl','Yokogawa',4)],
+      'B팀':[mk('공정1','FCV-5021','Flow Valve','Honeywell',5),mk('공정2','TIC-2034','Temp Ctrl','Honeywell',2)],
+      'C팀':[mk('공정1','LIC-4005','Level Ctrl','Honeywell',1),mk('공정2','FIC-2210','Feed Flow','Yokogawa',3)],
+    };
+    Object.keys(data).forEach(team=>{
+      const ws=X.utils.aoa_to_sheet([header].concat(data[team]));
+      ws['!cols']=[{wch:8},{wch:12},{wch:14},{wch:12}].concat(dates.map(()=>({wch:11})));
+      X.utils.book_append_sheet(wb,ws,team);
+    });
+    X.writeFile(wb,'ControlLoop_데이터등록_양식.xlsx');
+  }
+
+  triggerPick(){ if(this._fileInput) this._fileInput.click(); }
+
+  handleFiles(fileList){
+    const file=fileList&&fileList[0]; if(!file) return;
+    const X=window.XLSX; if(!X){ this.setState({parseErr:'엑셀 모듈 로딩 중입니다.',dragOver:false}); return; }
+    const rdr=new FileReader();
+    rdr.onload=(e)=>{
+      try{
+        const wb=X.read(e.target.result,{type:'array'});
+        const FIXED=new Set(['공정','Process','공정명','Tag ID','TagID','Tag','태그','Tag Name','TagName','이름','태그명','DCS','비고','Note','__EMPTY']);
+        const sheets=wb.SheetNames.map(nm=>{
+          const json=X.utils.sheet_to_json(wb.Sheets[nm],{defval:''});
+          const procMap={}; let valid=0, invalid=0;
+          json.forEach((r,idx)=>{
+            const g=(keys)=>{ for(const k of keys){ if(r[k]!==undefined&&r[k]!=='') return String(r[k]).trim(); } return ''; };
+            const proc=g(['공정','Process','공정명']), id=g(['Tag ID','TagID','Tag','태그']), name=g(['Tag Name','TagName','이름','태그명']), dcs=g(['DCS']);
+            const dateKeys=Object.keys(r).filter(k=>!FIXED.has(String(k).trim()));
+            const days=dateKeys.map(k=>{ const s=String(r[k]).trim(); return {date:String(k).trim(),status:s,ok:s===''||this.VALID_STATUS.includes(s)}; });
+            const filled=days.filter(d=>d.status!=='');
+            const autoDays=filled.filter(d=>['AUT','RCAS'].includes(d.status)).length;
+            const autoRate=filled.length?Math.round(autoDays/filled.length*1000)/10:0;
+            const badDays=days.filter(d=>!d.ok).length;
+            const errs=[];
+            if(dcs&&!this.VALID_DCS.includes(dcs)) errs.push('DCS');
+            if(badDays) errs.push('상태값('+badDays+'일)');
+            if(filled.length===0) errs.push('상태 미입력');
+            const ok=errs.length===0; ok?valid++:invalid++;
+            const pk=proc||'미지정';
+            (procMap[pk]=procMap[pk]||[]).push({row:idx+2,id,name,dcs,days,filled:filled.length,autoDays,autoRate,badDays,ok,errs});
+          });
+          return { sheet:nm, total:json.length, valid, invalid, procs:Object.keys(procMap).sort().map(k=>({name:k,rows:procMap[k]})) };
+        });
+        const sum=(f)=>sheets.reduce((a,s)=>a+f(s),0);
+        this.setState({ upload:{fileName:file.name,sheetCount:wb.SheetNames.length,sheetNames:wb.SheetNames,sheets,totalRows:sum(s=>s.total),totalValid:sum(s=>s.valid),totalInvalid:sum(s=>s.invalid)},upTeam:0,regDone:false,parseErr:'',dragOver:false });
+      }catch(err){ this.setState({parseErr:'파일을 읽는 중 오류가 발생했습니다: '+err.message,dragOver:false}); }
+    };
+    rdr.readAsArrayBuffer(file);
+  }
+
+  scAdmin(h,card,h2){
+    const accent=this.props.accent??'#E8390E', st=this.state, up=st.upload;
+    const th=(t,al)=>h('th',{style:{textAlign:al||'left',padding:'9px 12px',fontSize:'11px',fontWeight:700,color:'#7c7f88',background:'#fafbfc',borderBottom:'1px solid #eceef1',whiteSpace:'nowrap'}},t);
+    const td=(c,extra)=>h('td',{style:Object.assign({padding:'9px 12px',fontSize:'12.5px',color:'#2b2b35',borderBottom:'1px solid #f1f2f5'},extra||{})},c);
+    const btn=(label,onClick,kind,disabled)=>h('button',{onClick,disabled:!!disabled,style:{display:'inline-flex',alignItems:'center',gap:'7px',border:kind==='dark'?'none':'1px solid #dfe1e6',background:kind==='dark'?(disabled?'#666':'#16161f'):'#fff',color:kind==='dark'?'#fff':'#5b5e67',padding:'9px 18px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600,cursor:disabled?'not-allowed':'pointer',fontFamily:'inherit',opacity:disabled?0.7:1}},label);
+    const fileInput=h('input',{type:'file',accept:'.xlsx,.xls',ref:(el)=>{this._fileInput=el;},style:{display:'none'},onChange:(e)=>{ this.handleFiles(e.target.files); e.target.value=''; }});
+    const guide=h('div',{style:card({padding:'20px 22px',marginBottom:'16px'})},
+      h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'20px'}},
+        h('div',null,
+          h('div',{style:{fontSize:'15px',fontWeight:700,color:'#16161f',marginBottom:'8px'}},'Excel 업로드 양식'),
+          h('div',{style:{fontSize:'13px',color:'#6b6e77',lineHeight:1.7}},
+            '• 워크북은 ',h('b',null,'팀별 시트'),'로 구분합니다 — 시트명: ',h('span',{style:{fontFamily:'Inter',fontWeight:600}},'A팀 / B팀 / C팀'),h('br'),
+            '• 각 팀 시트 안에서 ',h('b',null,'공정 컬럼'),'으로 행을 구분합니다.',h('br'),
+            '• 고정 컬럼 ',h('span',{style:{fontFamily:'Inter'}},'공정 · Tag ID · Tag Name · DCS'),' 뒤로 ',h('b',null,'날짜별 상태 컬럼'),'(',h('span',{style:{fontFamily:'Inter'}},'YYYY-MM-DD'),')을 두고 상태코드를 입력합니다.',h('br'),
+            '• ',h('b',null,'DCS는 선택 항목'),'입니다 — 비워 두어도 정상 처리됩니다.')),
+        btn(h('span',null,'⬇ 양식 다운로드'),()=>this.downloadTemplate(),'line')),
+      h('div',{style:{display:'flex',gap:'18px',marginTop:'14px',flexWrap:'wrap'}},
+        [['공정','자유 입력'],['Tag ID','자유 입력'],['DCS','Yokogawa / Honeywell (선택)'],['날짜 셀 상태','AUT · RCAS · MAN · 0 · 1 · 2']].map((c,i)=>
+          h('div',{key:i,style:{fontSize:'11.5px',color:'#9a9da6'}},h('span',{style:{fontWeight:700,color:'#7c7f88'}},c[0]),'  ',c[1]))));
+
+    let body;
+    if(!up){
+      body=h('div',{
+        onClick:()=>this.triggerPick(),
+        onDragOver:(e)=>{e.preventDefault(); if(!st.dragOver)this.setState({dragOver:true});},
+        onDragLeave:(e)=>{e.preventDefault(); this.setState({dragOver:false});},
+        onDrop:(e)=>{e.preventDefault(); this.handleFiles(e.dataTransfer.files);},
+        style:{border:'2px dashed '+(st.dragOver?accent:'#cfd3da'),background:st.dragOver?'#fff7f4':'#fafbfc',borderRadius:'12px',padding:'48px 24px',textAlign:'center',cursor:'pointer',transition:'all .12s'}},
+        h('div',{style:{width:'52px',height:'52px',borderRadius:'13px',background:'#eef0f3',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 14px',fontSize:'24px'}},'⬆'),
+        h('div',{style:{fontSize:'15px',fontWeight:700,color:'#3a3a47',marginBottom:'5px'}},'Excel 파일을 여기에 끌어다 놓으세요'),
+        h('div',{style:{fontSize:'12.5px',color:'#9a9da6',marginBottom:'16px'}},'또는 클릭하여 파일 선택  ·  .xlsx, .xls 지원'),
+        h('span',{style:{display:'inline-block',border:'1px solid #dfe1e6',background:'#fff',color:'#3a3a47',padding:'9px 20px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600}},'파일 선택'),
+        st.parseErr?h('div',{style:{marginTop:'16px',color:'#FF4D4D',fontSize:'12.5px',fontWeight:600}},'⚠ '+st.parseErr):null);
+    } else {
+      const cur=up.sheets[st.upTeam]||up.sheets[0];
+      const stat=(label,val,color)=>h('div',{style:{flex:'none'}},h('div',{style:{fontSize:'11px',color:'#9a9da6',marginBottom:'3px'}},label),h('div',{className:'num',style:{fontSize:'20px',fontWeight:800,color:color||'#16161f'}},val));
+      const summary=h('div',{style:card({padding:'16px 20px',marginBottom:'14px',display:'flex',alignItems:'center',gap:'26px'})},
+        h('div',{style:{flex:1,minWidth:0}},
+          h('div',{style:{display:'flex',alignItems:'center',gap:'9px'}},
+            h('span',{style:{fontSize:'18px'}},'📄'),
+            h('span',{style:{fontSize:'14px',fontWeight:700,color:'#16161f',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},up.fileName)),
+          h('div',{style:{fontSize:'11.5px',color:'#9a9da6',marginTop:'4px'}},'시트 '+up.sheetCount+'개 · '+up.sheetNames.join(', '))),
+        stat('총 행',up.totalRows),
+        stat('정상',up.totalValid,'#52C41A'),
+        stat('오류',up.totalInvalid,up.totalInvalid?'#FF4D4D':'#c2c5cc'),
+        h('div',{style:{display:'flex',gap:'9px'}},
+          btn('다시 업로드',()=>this.setState({upload:null,regDone:false}),'line'),
+          btn(st.saving?'저장 중...':(up.totalInvalid?'오류 무시하고 병합 저장':'Firestore 병합 저장'),()=>this._registerData(),'dark',st.saving)));
+      const banner=st.regDone
+        ? h('div',{style:{display:'flex',alignItems:'center',gap:'10px',background:'#eaf7ea',border:'1px solid #b7e3b7',borderLeft:'4px solid #52C41A',borderRadius:'8px',padding:'12px 16px',marginBottom:'14px'}},
+            h('span',null,'✅'),h('span',{style:{fontSize:'13px',fontWeight:600,color:'#2e7d32'}},'병합 저장 완료. 정상 '+up.totalValid+'행이 반영되었습니다. 기존 데이터는 유지됩니다.'+(up.totalInvalid?(' (오류 '+up.totalInvalid+'행 제외)'):'')))
+        : (up.totalInvalid?h('div',{style:{display:'flex',alignItems:'center',gap:'10px',background:'#fff8e6',border:'1px solid #ffe1a8',borderLeft:'4px solid #FAAD14',borderRadius:'8px',padding:'12px 16px',marginBottom:'14px'}},
+            h('span',null,'⚠️'),h('span',{style:{fontSize:'13px',fontWeight:500,color:'#8a5a00'}},'검증 오류 '+up.totalInvalid+'행이 있습니다. 수정 후 재업로드하거나 정상 행만 저장할 수 있습니다.')):null);
+      const tabs=h('div',{style:{display:'flex',gap:'8px',marginBottom:'14px',flexWrap:'wrap'}},
+        up.sheets.map((s,i)=>h('div',{key:i,onClick:()=>this.setState({upTeam:i}),style:{display:'flex',alignItems:'center',gap:'8px',padding:'8px 15px',borderRadius:'8px',cursor:'pointer',fontSize:'13px',fontWeight:600,whiteSpace:'nowrap',border:'1px solid '+(st.upTeam===i?'#16161f':'#dfe1e6'),background:st.upTeam===i?'#16161f':'#fff',color:st.upTeam===i?'#fff':'#5b5e67'}},
+          s.sheet,
+          h('span',{className:'num',style:{fontSize:'11px',fontWeight:700,padding:'1px 7px',borderRadius:'9px',background:st.upTeam===i?'rgba(255,255,255,.18)':'#f1f2f5',color:s.invalid?(st.upTeam===i?'#ffb4b4':'#FF4D4D'):(st.upTeam===i?'#fff':'#7c7f88')}},s.invalid?(s.valid+'/'+s.total):s.total))));
+      const dayColor=(d)=>!d.ok?'#c0392b':(d.status===''?'#e5e7eb':(['AUT','RCAS'].includes(d.status)?'#1890FF':'#FF4D4D'));
+      const procBlocks=cur.procs.length?cur.procs.map((p,pi)=>{
+        const rows=p.rows.map((r,ri)=>h('tr',{key:ri,style:{background:r.ok?'':'#fff5f5'}},
+          td(r.row,{textAlign:'center',color:'#9a9da6',fontFamily:'Inter'}),
+          td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6'}},r.id||'—')),
+          td(r.name||h('span',{style:{color:'#c2c5cc'}},'—')),
+          td(r.dcs
+            ?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'2px 8px',borderRadius:'5px',background:r.errs.includes('DCS')?'#fdecec':this.dcsBg(r.dcs),color:r.errs.includes('DCS')?'#c0392b':this.dcsFg(r.dcs)}},r.dcs)
+            :h('span',{style:{fontSize:'11px',fontWeight:600,padding:'2px 8px',borderRadius:'5px',background:'#f1f2f5',color:'#a7aab2'}},'미지정')),
+          td(h('div',{style:{display:'flex',gap:'2px',flexWrap:'wrap',maxWidth:'380px'}},r.days.map((d,di)=>h('div',{key:di,title:d.date+' · '+(d.status||'미입력'),style:{width:'9px',height:'15px',borderRadius:'2px',background:dayColor(d)}})))),
+          td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:this.rateColor(r.autoRate)}},r.filled?r.autoRate+'%':'—'),{textAlign:'right'}),
+          td(h('span',{className:'num',style:{color:'#9a9da6',fontSize:'12px'}},r.filled+'일'),{textAlign:'center'}),
+          td(r.ok
+            ?h('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',fontSize:'12px',fontWeight:700,color:'#2e7d32'}},'✔ 정상')
+            :h('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',fontSize:'11.5px',fontWeight:700,color:'#c0392b'}},'✘ '+r.errs.join(', ')),{textAlign:'center'})));
+        return h('div',{key:pi,style:{marginBottom:'16px'}},
+          h('div',{style:{display:'flex',alignItems:'center',gap:'9px',margin:'0 0 8px'}},
+            h('span',{style:{fontSize:'13px',fontWeight:700,color:'#16161f'}},p.name),
+            h('span',{style:{fontSize:'11px',color:'#9a9da6'}},p.rows.length+'개 Tag')),
+          h('div',{style:card({overflow:'hidden'})},
+            h('table',{style:{width:'100%',borderCollapse:'collapse'}},
+              h('thead',null,h('tr',null,th('행','center'),th('Tag ID'),th('Tag Name'),th('DCS'),th('일별 상태'),th('Auto율','right'),th('입력일','center'),th('검증','center'))),
+              h('tbody',null,rows))));
+      }):h('div',{style:card({padding:'40px',textAlign:'center',color:'#9a9da6',fontSize:'13px'})},'이 시트에서 인식된 데이터 행이 없습니다.');
+      body=h('div',null,summary,banner,tabs,h('div',null,procBlocks));
+    }
+
+    const settings=h('div',{style:{marginTop:'26px'}},
+      h('div',{style:{fontSize:'12px',fontWeight:700,color:'#9a9da6',marginBottom:'12px',letterSpacing:'.3px'}},'기타 설정'),
+      h('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}},
+        [['목표 Auto율 임계값','팀·공정별 목표/경고/위험 임계값'],['DCS 상태 코드 매핑','Yokogawa/Honeywell 코드의 Auto/MAN 인정 기준'],['Tag 마스터 관리','Tag-공정-팀 매핑 및 비활성 Tag 제외'],['알림 수신 설정','임계값 미달 시 수신 대상·채널']].map((c,i)=>
+          h('div',{key:i,style:card({padding:'15px 18px'})},h('div',{style:{fontSize:'13px',fontWeight:700,color:'#16161f',marginBottom:'4px'}},c[0]),h('div',{style:{fontSize:'12px',color:'#7c7f88',lineHeight:1.5}},c[1])))));
+
+    return h('div',null,this.pageTitle(h,'관리자 설정 · Excel 데이터 등록'),fileInput,guide,body,settings);
+  }
+
+  // ===== layout =====
+  renderLayout(){
+    const h=React.createElement;
+
+    if(this.state.loading){
+      return h('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:'#eceef1',flexDirection:'column',gap:'14px'}},
+        h('div',{style:{width:'36px',height:'36px',border:'3px solid #e3e5ea',borderTop:'3px solid #16161f',borderRadius:'50%',animation:'spin .8s linear infinite'}}),
+        h('div',{style:{fontSize:'14px',color:'#6b6e77',fontWeight:500}},'Firestore에서 데이터를 불러오는 중...'));
+    }
+
+    if(this.state.loadError){
+      return h('div',{style:{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',background:'#eceef1',flexDirection:'column',gap:'12px'}},
+        h('div',{style:{fontSize:'28px'}},'⚠️'),
+        h('div',{style:{fontSize:'15px',fontWeight:700,color:'#16161f'}},'Firestore 연결 오류'),
+        h('div',{style:{fontSize:'13px',color:'#FF4D4D',maxWidth:'400px',textAlign:'center'}},this.state.loadError),
+        h('button',{onClick:()=>{ this.setState({loading:true,loadError:''}); this._loadData(); },style:{marginTop:'8px',border:'none',background:'#16161f',color:'#fff',padding:'9px 20px',borderRadius:'7px',fontSize:'13px',fontWeight:600,cursor:'pointer',fontFamily:'inherit'}},'다시 시도'));
+    }
+
+    const vals=this.renderVals();
+    const { accent, alertCount, nav, sideTeams, crumbs, banner, modal, screenView }=vals;
+
+    const gearPath='M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z';
+
+    const gnb=h('header',{style:{flex:'none',height:'56px',background:'#16161f',display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 22px',color:'#fff',zIndex:30,boxShadow:'0 1px 0 rgba(255,255,255,.04)'}},
+      h('div',{style:{display:'flex',alignItems:'center',gap:'11px'}},
+        h('div',{style:{width:'26px',height:'26px',borderRadius:'7px',background:accent,display:'flex',alignItems:'center',justifyContent:'center',fontWeight:800,fontSize:'13px',color:'#fff',letterSpacing:'-.5px'}},'CL'),
+        h('span',{style:{fontWeight:700,fontSize:'15.5px',letterSpacing:'-.3px'}},'Control Loop 관리'),
+        h('span',{style:{fontSize:'11px',color:'#8b8d99',borderLeft:'1px solid #34343f',paddingLeft:'11px',marginLeft:'3px'}},'DCS PID Auto율 모니터링')
+      ),
+      h('div',{style:{display:'flex',alignItems:'center',gap:'18px'}},
+        h('div',{style:{position:'relative',cursor:'pointer',width:'30px',height:'30px',display:'flex',alignItems:'center',justifyContent:'center',borderRadius:'7px'}},
+          h('svg',{width:17,height:17,viewBox:'0 0 24 24',fill:'none',stroke:'#c9cbd6',strokeWidth:2,strokeLinecap:'round',strokeLinejoin:'round'},
+            h('path',{d:'M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9'}),
+            h('path',{d:'M13.73 21a2 2 0 0 1-3.46 0'})),
+          alertCount>0?h('span',{className:'num',style:{position:'absolute',top:'3px',right:'3px',minWidth:'15px',height:'15px',padding:'0 3px',background:accent,color:'#fff',borderRadius:'8px',fontSize:'9.5px',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center'}},String(alertCount)):null
+        ),
+        h('div',{style:{width:'30px',height:'30px',display:'flex',alignItems:'center',justifyContent:'center',borderRadius:'7px',cursor:'pointer'}},
+          h('svg',{width:17,height:17,viewBox:'0 0 24 24',fill:'none',stroke:'#c9cbd6',strokeWidth:2,strokeLinecap:'round',strokeLinejoin:'round'},
+            h('circle',{cx:12,cy:12,r:3}),h('path',{d:gearPath}))),
+        h('div',{style:{display:'flex',alignItems:'center',gap:'9px',paddingLeft:'16px',borderLeft:'1px solid #2c2c36'}},
+          h('div',{style:{width:'28px',height:'28px',borderRadius:'50%',background:'#3a3a47',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'12px',fontWeight:600,color:'#dfe1ea'}},'관'),
+          h('div',{style:{lineHeight:1.2}},
+            h('div',{style:{fontSize:'12.5px',fontWeight:600}},'관리자'),
+            h('div',{style:{fontSize:'10.5px',color:'#8b8d99'}},'Control Loop 담당')))
+      )
+    );
+
+    const navIt=(key,label,icon)=>h('div',{onClick:nav[key].onClick,style:{display:'flex',alignItems:'center',gap:'10px',margin:'1px 8px',padding:'9px 11px',borderRadius:'7px',cursor:'pointer',fontSize:'13.5px',fontWeight:600,color:nav[key].fg,background:nav[key].bg,borderLeft:'3px solid '+nav[key].border}},icon,label);
+    const ovIcon=h('svg',{width:16,height:16,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2},h('rect',{x:3,y:3,width:7,height:9}),h('rect',{x:14,y:3,width:7,height:5}),h('rect',{x:14,y:12,width:7,height:9}),h('rect',{x:3,y:16,width:7,height:5}));
+    const moIcon=h('svg',{width:16,height:16,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2},h('rect',{x:3,y:4,width:18,height:18,rx:2}),h('line',{x1:16,y1:2,x2:16,y2:6}),h('line',{x1:8,y1:2,x2:8,y2:6}),h('line',{x1:3,y1:10,x2:21,y2:10}));
+    const chIcon=h('svg',{width:16,height:16,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2},h('path',{d:'M23 6l-9.5 9.5-5-5L1 18'}),h('polyline',{points:'17 6 23 6 23 12'}));
+    const adIcon=h('svg',{width:16,height:16,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:2},h('circle',{cx:12,cy:12,r:3}),h('path',{d:gearPath}));
+
+    const teamItems=sideTeams.map((t,ti)=>h('div',{key:ti},
+      h('div',{onClick:t.onToggle,style:{display:'flex',alignItems:'center',gap:'9px',margin:'1px 8px',padding:'9px 11px',borderRadius:'7px',cursor:'pointer',fontSize:'13px',fontWeight:t.weight,color:t.fg,background:t.bg,borderLeft:'3px solid '+t.border}},
+        h('span',{style:{fontSize:'9px',color:'#9a9da6',transform:t.caret,transition:'transform .15s',display:'inline-block'}},'▶'),
+        h('span',{style:{width:'7px',height:'7px',borderRadius:'50%',background:t.dot}}),
+        h('span',{style:{flex:1}},t.name),
+        h('span',{className:'num',style:{fontSize:'11px',color:'#9a9da6',fontWeight:600}},t.rate+'%')),
+      t.open?h('div',null,t.procs.map((p,pi)=>h('div',{key:pi,onClick:p.onClick,style:{display:'flex',alignItems:'center',gap:'8px',margin:'1px 8px 1px 26px',padding:'7px 11px',borderRadius:'6px',cursor:'pointer',fontSize:'12.5px',color:p.fg,background:p.bg}},
+        h('span',{style:{color:'#c2c5cc',fontSize:'10px'}},'└'),
+        h('span',{style:{flex:1}},p.name),
+        h('span',{className:'num',style:{fontSize:'10.5px',color:p.rateColor,fontWeight:600}},p.rate+'%')))):null));
+
+    const now=new Date(); const dateStr=now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+    const sideChildren=[
+      h('div',{key:'ml',style:{padding:'0 16px 8px',fontSize:'10.5px',fontWeight:700,color:'#9a9da6',letterSpacing:'.4px'}},'메뉴'),
+      navIt('overview','전사 Overview',ovIcon),
+      h('div',{key:'tl',style:{padding:'13px 16px 5px',fontSize:'10.5px',fontWeight:700,color:'#9a9da6',letterSpacing:'.4px'}},'팀별 현황'),
+      ...teamItems,
+      h('div',{key:'div',style:{height:'1px',background:'#e3e5ea',margin:'12px 16px'}}),
+      navIt('monthly','월별 요약',moIcon),
+      navIt('change','변동 분석',chIcon),
+      navIt('admin','관리자 설정',adIcon),
+      h('div',{key:'sp',style:{flex:1}}),
+      h('div',{key:'ts',style:{padding:'12px 18px',fontSize:'10.5px',color:'#a7aab2',lineHeight:1.5}},'데이터 기준일',h('br'),h('span',{className:'num',style:{color:'#7c7f88',fontWeight:600}},dateStr)),
+    ];
+    const sidebar=h('aside',{style:{flex:'none',width:'236px',background:'#f4f5f7',borderRight:'1px solid #e3e5ea',display:'flex',flexDirection:'column',overflowY:'auto',padding:'14px 0'}},
+      ...sideChildren);
+
+    const crumbEls=crumbs.reduce((acc,c,i)=>{ acc.push(h('span',{key:'l'+i,style:{color:c.color,fontWeight:c.weight}},c.label)); if(c.sep) acc.push(h('span',{key:'s'+i,style:{color:'#c7cad0'}},c.sep)); return acc; },[]);
+    const bannerEl=banner.show?h('div',{style:{display:'flex',alignItems:'center',gap:'11px',background:banner.bg,border:'1px solid '+banner.bd,borderLeft:'4px solid '+banner.accent,borderRadius:'8px',padding:'12px 16px',marginBottom:'18px'}},
+      h('span',{style:{fontSize:'15px'}},banner.icon),
+      h('span',{style:{fontSize:'13px',color:banner.fg,fontWeight:500}},banner.text)):null;
+
+    const main=h('main',{style:{flex:1,minWidth:0,overflowY:'auto',background:'#eceef1',padding:0}},
+      h('div',{style:{maxWidth:'1640px',margin:'0 auto',padding:'22px 30px 48px'}},
+        h('div',{style:{display:'flex',alignItems:'center',gap:'7px',fontSize:'12px',color:'#8b8e97',marginBottom:'14px'}},crumbEls),
+        bannerEl,
+        h('div',{ref:vals.screenRef},screenView)));
+
+    let modalEl=null;
+    if(modal.open){
+      modalEl=h('div',{onClick:modal.onClose,style:{position:'fixed',inset:0,background:'rgba(16,16,24,.45)',zIndex:50,display:'flex',alignItems:'center',justifyContent:'center'}},
+        h('div',{onClick:modal.stop,style:{width:'760px',maxHeight:'84vh',overflowY:'auto',background:'#fff',borderRadius:'12px',boxShadow:'0 24px 60px rgba(0,0,0,.3)'}},
+          h('div',{style:{display:'flex',alignItems:'flex-start',justifyContent:'space-between',padding:'20px 24px',borderBottom:'1px solid #eef0f3'}},
+            h('div',null,
+              h('div',{style:{display:'flex',alignItems:'center',gap:'10px'}},
+                h('span',{className:'num',style:{fontSize:'19px',fontWeight:700,color:'#16161f'}},modal.id),
+                modal.dcs?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'3px 9px',borderRadius:'5px',background:modal.dcsBg,color:modal.dcsFg}},modal.dcs):null,
+                h('span',{style:{fontSize:'11px',fontWeight:600,padding:'3px 9px',borderRadius:'5px',background:modal.stBg,color:modal.stFg}},'현재 '+modal.statusCode)),
+              h('div',{style:{fontSize:'13px',color:'#6b6e77',marginTop:'5px'}},modal.name+(modal.path?' · '+modal.path:''))),
+            h('div',{onClick:modal.onClose,style:{cursor:'pointer',width:'30px',height:'30px',borderRadius:'7px',display:'flex',alignItems:'center',justifyContent:'center',color:'#9a9da6',fontSize:'18px'}},'✕')),
+          h('div',{style:{padding:'20px 24px'}},
+            h('div',{style:{display:'flex',gap:'14px',marginBottom:'20px'}},
+              h('div',{style:{flex:1,background:'#f7f8fa',borderRadius:'8px',padding:'13px 15px'}},h('div',{style:{fontSize:'11px',color:'#8b8e97',marginBottom:'4px'}},'당월 Auto율'),h('div',{className:'num',style:{fontSize:'26px',fontWeight:700,color:modal.rateColor}},modal.rate,h('span',{style:{fontSize:'15px'}},'%'))),
+              h('div',{style:{flex:1,background:'#f7f8fa',borderRadius:'8px',padding:'13px 15px'}},h('div',{style:{fontSize:'11px',color:'#8b8e97',marginBottom:'4px'}},'전월 대비'),h('div',{className:'num',style:{fontSize:'26px',fontWeight:700,color:modal.deltaColor}},modal.deltaArrow+' '+modal.deltaTxt)),
+              h('div',{style:{flex:1,background:'#f7f8fa',borderRadius:'8px',padding:'13px 15px'}},h('div',{style:{fontSize:'11px',color:'#8b8e97',marginBottom:'4px'}},'MAN 전환 (당월)'),h('div',{className:'num',style:{fontSize:'26px',fontWeight:700,color:'#16161f'}},modal.manDays,h('span',{style:{fontSize:'14px',color:'#8b8e97'}},'일')))),
+            h('div',{style:{fontSize:'13px',fontWeight:600,color:'#3a3a47',marginBottom:'10px'}},'최근 60일 상태 이력 히트맵'),
+            h('div',{style:{display:'grid',gridTemplateColumns:'repeat(30,1fr)',gap:'4px',marginBottom:'8px'}},
+              modal.heat.map((hv,hi)=>h('div',{key:hi,title:hv.title,style:{aspectRatio:'1',borderRadius:'3px',background:hv.bg}}))),
+            h('div',{style:{display:'flex',gap:'16px',fontSize:'11px',color:'#8b8e97',marginBottom:'22px'}},
+              h('span',{style:{display:'flex',alignItems:'center',gap:'5px'}},h('span',{style:{width:'10px',height:'10px',borderRadius:'2px',background:'#1890FF'}}),'AUT'),
+              h('span',{style:{display:'flex',alignItems:'center',gap:'5px'}},h('span',{style:{width:'10px',height:'10px',borderRadius:'2px',background:'#FF4D4D'}}),'MAN'),
+              h('span',{style:{display:'flex',alignItems:'center',gap:'5px'}},h('span',{style:{width:'10px',height:'10px',borderRadius:'2px',background:'#d9d9d9'}}),'데이터 없음')),
+            h('div',{style:{fontSize:'13px',fontWeight:600,color:'#3a3a47',marginBottom:'8px'}},'운전 코멘트'),
+            h('textarea',{placeholder:'상태 변동 사유 또는 조치 내용을 입력하세요',style:{width:'100%',height:'74px',border:'1px solid #dfe1e6',borderRadius:'8px',padding:'10px 12px',fontSize:'13px',fontFamily:'inherit',resize:'none',color:'#2b2b35',outline:'none'}}),
+            h('div',{style:{display:'flex',justifyContent:'flex-end',gap:'9px',marginTop:'12px'}},
+              h('button',{onClick:modal.onClose,style:{border:'1px solid #dfe1e6',background:'#fff',color:'#5b5e67',padding:'9px 18px',borderRadius:'7px',fontSize:'13px',fontWeight:600,cursor:'pointer',fontFamily:'inherit'}},'취소'),
+              h('button',{style:{border:'none',background:'#16161f',color:'#fff',padding:'9px 20px',borderRadius:'7px',fontSize:'13px',fontWeight:600,cursor:'pointer',fontFamily:'inherit'}},'코멘트 저장')))));
+    }
+
+    return h('div',{style:{display:'flex',flexDirection:'column',height:'100vh',minWidth:'1280px',overflow:'hidden',background:'#eceef1'}},
+      gnb,
+      h('div',{style:{display:'flex',flex:1,minHeight:0}},sidebar,main),
+      modalEl);
+  }
+}
+
+class App extends React.Component {
+  constructor(props){
+    super(props);
+    this._logic=new Component({accent:'#E8390E',targetRate:90});
+    this._logic.__host=this;
+    this.state={_v:0};
+  }
+  __setLogicState(update,cb){
+    const prev=this._logic.state;
+    const patch=typeof update==='function'?update(prev):update;
+    this._logic.state=Object.assign({},prev,patch);
+    this.setState(s=>({_v:s._v+1}),cb);
+  }
+  componentDidMount(){ this._logic.componentDidMount(); }
+  render(){ return this._logic.renderLayout(); }
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(h(App,null));
+</script>
+</body>
+</html>
