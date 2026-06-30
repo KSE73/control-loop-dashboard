@@ -64,7 +64,7 @@ class Component extends DCLogic {
   state = {
     screen:'overview', team:'', proc:0, modal:null, expanded:{},
     changeType:'all', changeTeam:'all', changeProc:'all', year:2026,
-    adminTab:'master',
+    adminTab:'master', teamViewMode:'monthly', teamDailyMonth:'',
     masterUpload:null, masterDragOver:false, masterParseErr:'', masterSaving:false, masterUpTeam:0,
     dailyUpload:null, dailyDragOver:false, dailyParseErr:'', dailySaving:false, dailyUpTeam:0, dailySaveResult:null,
     loading:true, loadError:'', saving:false
@@ -313,7 +313,7 @@ class Component extends DCLogic {
     const mNum = s => { const p=(s||'').split(/[-\/]/); const n=parseInt(p[1]); return isNaN(n)?'':n+'월'; };
     const curMonthLabel = mNum(curMonth);
     const prevMonthLabel = mNum(prevMonth);
-    return { teams, target:90, teamMonthly, overallMonthly, dailyTeam, dailyDates:last90, dailyLabels, changeEvents, monthLabels, teamIds, curMonthLabel, prevMonthLabel };
+    return { teams, target:90, teamMonthly, overallMonthly, dailyTeam, dailyDates:last90, dailyLabels, changeEvents, monthLabels, useMonths, teamIds, curMonthLabel, prevMonthLabel };
   }
 
   // ===== helpers =====
@@ -332,7 +332,7 @@ class Component extends DCLogic {
   componentDidMount(){ this._loadData(); }
 
   scheduleDraw(force){
-    const sig=this.state.screen+'|'+this.state.team+'|'+this.state.year+'|'+this.state.changeType+'|'+this.T();
+    const sig=this.state.screen+'|'+this.state.team+'|'+this.state.year+'|'+this.state.changeType+'|'+this.T()+'|'+(this.state.teamViewMode||'monthly')+'|'+(this.state.teamDailyMonth||'');
     if(!force&&sig===this._sig) return;
     this._sig=sig;
     if(!window.echarts){ clearTimeout(this._t); this._t=setTimeout(()=>{ this._sig=null; this.scheduleDraw(true); },120); return; }
@@ -377,14 +377,27 @@ class Component extends DCLogic {
     }
     if(sc==='team'){
       const tm=this.curTeam(); if(!tm) return;
-      const dates=D.dailyDates||D.dailyLabels;
-      const tickInterval=Math.max(1, Math.ceil(dates.length/10)-1);
+      const viewMode=this.state.teamViewMode||'monthly';
+      const allDates=D.dailyDates||D.dailyLabels;
+      let dates,procData;
+      if(viewMode==='daily'){
+        const months=D.useMonths||[];
+        const selMonth=this.state.teamDailyMonth||(months.length?months[months.length-1]:'');
+        const filtered=selMonth?allDates.map((d,i)=>({d,i})).filter(x=>x.d.startsWith(selMonth)):allDates.map((d,i)=>({d,i}));
+        dates=filtered.map(x=>x.d);
+        procData=(D.dailyTeam[tm.id]||[]).map(pd=>filtered.map(x=>pd[x.i]));
+      }else{
+        dates=allDates;
+        procData=(D.dailyTeam[tm.id]||[]);
+      }
+      const isDailyMode=viewMode==='daily';
+      const tickInterval=Math.max(1,Math.ceil(dates.length/10)-1);
       const fmtDate=val=>{ const p=String(val).split('-'); return p.length===3?`${parseInt(p[1])}/${parseInt(p[2])}`:val; };
       this.mount('tdLine',{
-        grid:{left:46,right:24,top:26,bottom:44},
+        grid:{left:46,right:24,top:26,bottom:isDailyMode?28:44},
         legend:{top:0,left:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
         xAxis:{type:'category',data:dates,
-          axisLabel:{color:'#9a9da6',interval:tickInterval,formatter:fmtDate,rotate:dates.length>60?30:0},
+          axisLabel:{color:'#9a9da6',interval:tickInterval,formatter:fmtDate,rotate:dates.length>20?30:0},
           axisLine:{lineStyle:{color:grid}},
           axisTick:{alignWithLabel:true}},
         yAxis:{type:'value',min:0,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
@@ -395,8 +408,8 @@ class Component extends DCLogic {
           const lines=params.filter(x=>x.seriesName!=='목표'&&x.value!=null).map(x=>`${x.marker}${x.seriesName}: <b>${x.value}%</b>`);
           return `<div style="font-size:12px;line-height:1.6"><span style="font-weight:600;color:#3a3a47">${dateStr}</span><br>${lines.join('<br>')}</div>`;
         }},
-        dataZoom:[{type:'inside'},{type:'slider',height:16,bottom:4}],
-        series:tm.processes.map((p,i)=>({name:p.name,type:'line',smooth:true,symbol:'none',data:(D.dailyTeam[tm.id]||[])[i]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
+        dataZoom:isDailyMode?[]:[{type:'inside'},{type:'slider',height:16,bottom:4}],
+        series:tm.processes.map((p,i)=>({name:p.name,type:'line',smooth:true,symbol:isDailyMode?'circle':'none',symbolSize:5,data:procData[i]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
           .concat([{name:'목표',type:'line',data:dates.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
       });
     }
@@ -578,25 +591,71 @@ class Component extends DCLogic {
 
   scTeam(h,D,T,card,h2,th,td){
     const tm=this.curTeam(); if(!tm) return h('div',null,'팀 데이터 없음');
-    const rows=tm.processes.map((p,pi)=>{
-      const d=this.delta(p.rate,p.prevRate); const ok=p.rate>=T;
-      return h('tr',{key:pi,onClick:()=>this.go({screen:'process',team:tm.id,proc:pi}),style:{cursor:'pointer'},
-        onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},
-        td(h('div',null,h('div',{style:{fontWeight:600,color:'#16161f'}},p.name),p.sub?h('div',{style:{fontSize:'11px',color:'#9a9da6',marginTop:'2px'}},p.sub):null)),
-        td(p.total.toLocaleString(),{textAlign:'right',fontFamily:'Inter'}),
-        td(p.autoLoop.toLocaleString(),{textAlign:'right',fontFamily:'Inter'}),
-        td(h('span',{style:{fontWeight:700,color:this.rateColor(p.rate)}},p.rate+'%'),{textAlign:'right',fontFamily:'Inter'}),
-        td(p.prevRate+'%',{textAlign:'right',fontFamily:'Inter',color:'#9a9da6'}),
-        td(h('span',{style:{fontWeight:700,color:d.color}},d.arrow+' '+d.txt),{textAlign:'right',fontFamily:'Inter'}),
-        td(h('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px',fontSize:'12px',fontWeight:600,color:ok?'#2e7d32':'#c0392b'}},
-          h('span',{style:{width:'8px',height:'8px',borderRadius:'50%',background:ok?'#52C41A':'#FF4D4D'}}),ok?'달성':'미달'),{textAlign:'center'}));
+    const st=this.state;
+    const viewMode=st.teamViewMode||'monthly';
+    const toggleBar=h('div',{style:{display:'flex',gap:'4px',background:'#f1f2f5',borderRadius:'10px',padding:'4px',marginBottom:'20px',width:'fit-content'}},
+      ['monthly','daily'].map((key,i)=>h('div',{key,onClick:()=>this.go({teamViewMode:key}),style:{padding:'8px 22px',borderRadius:'7px',fontSize:'13px',fontWeight:600,cursor:'pointer',transition:'all .1s',background:viewMode===key?'#fff':'transparent',color:viewMode===key?'#16161f':'#6b6e77',boxShadow:viewMode===key?'0 1px 3px rgba(0,0,0,.08)':'none'}},i===0?'월별 조회':'일별 조회')));
+    if(viewMode==='monthly'){
+      const rows=tm.processes.map((p,pi)=>{
+        const d=this.delta(p.rate,p.prevRate); const ok=p.rate>=T;
+        return h('tr',{key:pi,onClick:()=>this.go({screen:'process',team:tm.id,proc:pi}),style:{cursor:'pointer'},
+          onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},
+          td(h('div',null,h('div',{style:{fontWeight:600,color:'#16161f'}},p.name),p.sub?h('div',{style:{fontSize:'11px',color:'#9a9da6',marginTop:'2px'}},p.sub):null)),
+          td(p.total.toLocaleString(),{textAlign:'right',fontFamily:'Inter'}),
+          td(p.autoLoop.toLocaleString(),{textAlign:'right',fontFamily:'Inter'}),
+          td(h('span',{style:{fontWeight:700,color:this.rateColor(p.rate)}},p.rate+'%'),{textAlign:'right',fontFamily:'Inter'}),
+          td(p.prevRate+'%',{textAlign:'right',fontFamily:'Inter',color:'#9a9da6'}),
+          td(h('span',{style:{fontWeight:700,color:d.color}},d.arrow+' '+d.txt),{textAlign:'right',fontFamily:'Inter'}),
+          td(h('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px',fontSize:'12px',fontWeight:600,color:ok?'#2e7d32':'#c0392b'}},
+            h('span',{style:{width:'8px',height:'8px',borderRadius:'50%',background:ok?'#52C41A':'#FF4D4D'}}),ok?'달성':'미달'),{textAlign:'center'}));
+      });
+      const table=h('div',{style:card({overflow:'hidden',marginBottom:'18px'})},
+        h('table',{style:{width:'100%',borderCollapse:'collapse'}},
+          h('thead',null,h('tr',null,th('공정명'),th('전체 Loop','right'),th('Auto Loop','right'),th('Auto율 ('+(D.curMonthLabel||'당월')+')','right'),th('전월 ('+(D.prevMonthLabel||'—')+')','right'),th('변동(Δ)','right'),th('상태','center'))),
+          h('tbody',null,rows)));
+      const chart=h('div',{style:card({padding:'18px 20px'})},h2('공정별 일별 Auto율 추이','최근 90일'),h('div',{id:'tdLine',style:{height:'300px'}}));
+      return h('div',null,this.pageTitle(h,tm.name+' — Control Loop Auto율 현황'),toggleBar,table,chart);
+    }
+    // ── daily view ──
+    const months=D.useMonths||[];
+    const selMonth=st.teamDailyMonth||(months.length?months[months.length-1]:'');
+    const monthPills=h('div',{style:{display:'flex',gap:'6px',flexWrap:'wrap',marginBottom:'18px'}},
+      months.map((m,mi)=>{
+        const label=parseInt(m.split('-')[1])+'월';
+        const isActive=m===selMonth;
+        return h('div',{key:mi,onClick:()=>this.go({teamDailyMonth:m}),style:{padding:'6px 14px',borderRadius:'20px',fontSize:'12.5px',fontWeight:600,cursor:'pointer',background:isActive?'#16161f':'#fff',color:isActive?'#fff':'#5b5e67',border:'1px solid '+(isActive?'#16161f':'#dfe1e6')}},label);
+      }));
+    const selLabel=selMonth?(parseInt(selMonth.split('-')[1])+'월 일별 Auto율 추이'):'일별 Auto율 추이';
+    const chart=h('div',{style:card({padding:'18px 20px',marginBottom:'18px'})},h2(selLabel),h('div',{id:'tdLine',style:{height:'280px'}}));
+    const allDates=D.dailyDates||[];
+    const filteredDates=selMonth?allDates.filter(d=>d.startsWith(selMonth)):allDates;
+    const procNames=tm.processes.map(p=>p.name);
+    const thRow=h('tr',null,[
+      th('날짜'),
+      ...procNames.map((name,pi)=>h('th',{key:pi,style:{textAlign:'center',padding:'11px 14px',fontSize:'11.5px',fontWeight:700,color:'#7c7f88',background:'#fafbfc',borderBottom:'1px solid #eceef1',whiteSpace:'nowrap'}},name)),
+      th('전체 평균','right')
+    ]);
+    const dailyRows=filteredDates.map((date)=>{
+      const idx=allDates.indexOf(date);
+      const procRates=(D.dailyTeam[tm.id]||[]).map(pd=>idx>=0?pd[idx]:null);
+      const valid=procRates.filter(v=>v!=null);
+      const avg=valid.length?Math.round(valid.reduce((a,v)=>a+v,0)/valid.length*10)/10:null;
+      const pp=date.split('-');
+      const dateLabel=pp.length===3?`${parseInt(pp[1])}/${parseInt(pp[2])}`:date;
+      return h('tr',{key:date,onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},[
+        td(h('span',{className:'num',style:{color:'#6b6e77',whiteSpace:'nowrap'}},dateLabel)),
+        ...procRates.map((v,vi)=>h('td',{key:vi,style:{padding:'11px 14px',fontSize:'13px',color:'#2b2b35',borderBottom:'1px solid #f1f2f5',textAlign:'center',fontFamily:'Inter'}},
+          v!=null?h('span',{style:{fontWeight:600,color:this.rateColor(v)}},v+'%'):h('span',{style:{color:'#c2c5cc'}},'—'))),
+        td(avg!=null?h('span',{style:{fontWeight:700,color:this.rateColor(avg)}},avg+'%'):h('span',{style:{color:'#c2c5cc'}},'—'),{textAlign:'right',fontFamily:'Inter'})
+      ]);
     });
-    const table=h('div',{style:card({overflow:'hidden',marginBottom:'18px'})},
-      h('table',{style:{width:'100%',borderCollapse:'collapse'}},
-        h('thead',null,h('tr',null,th('공정명'),th('전체 Loop','right'),th('Auto Loop','right'),th('Auto율 ('+(D.curMonthLabel||'당월')+')','right'),th('전월 ('+(D.prevMonthLabel||'—')+')','right'),th('변동(Δ)','right'),th('상태','center'))),
-        h('tbody',null,rows)));
-    const chart=h('div',{style:card({padding:'18px 20px'})},h2('공정별 일별 Auto율 추이','최근 90일'),h('div',{id:'tdLine',style:{height:'300px'}}));
-    return h('div',null,this.pageTitle(h,tm.name+' — Control Loop Auto율 현황'),table,chart);
+    const emptyRow=h('tr',null,h('td',{colSpan:procNames.length+2,style:{padding:'40px',textAlign:'center',color:'#9a9da6',fontSize:'13px'}},'선택한 기간의 데이터가 없습니다.'));
+    const dailyTable=h('div',{style:card({overflow:'hidden'})},
+      h('div',{style:{overflowX:'auto'}},
+        h('table',{style:{width:'100%',borderCollapse:'collapse',minWidth:'400px'}},
+          h('thead',null,thRow),
+          h('tbody',null,dailyRows.length?dailyRows:[emptyRow]))));
+    return h('div',null,this.pageTitle(h,tm.name+' — Control Loop Auto율 현황'),toggleBar,monthPills,chart,dailyTable);
   }
 
   scProcess(h,D,T,card,h2,th,td){
