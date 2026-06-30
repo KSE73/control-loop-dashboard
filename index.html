@@ -156,7 +156,7 @@ class Component extends DCLogic {
 
   // ===== Daily (날짜별 데이터) =====
   _extractDailyFromUpload(up){
-    const nd=d=>{ const s=String(d).trim(); const p=s.split(/[-\/]/); if(p.length<3) return s; if(p[0].length===4) return `${p[0]}-${p[1].padStart(2,'0')}-${p[2].padStart(2,'0')}`; if(p[2].length===4) return `${p[2]}-${p[0].padStart(2,'0')}-${p[1].padStart(2,'0')}`; return s; };
+    const nd=d=>{ const s=String(d).trim(); const p=s.split(/[-\/]/); if(p.length<3) return s; if(p[0].length===4) return `${p[0]}-${p[1].padStart(2,'0')}-${p[2].padStart(2,'0')}`; if(p[2].length===4) return `${p[2]}-${p[0].padStart(2,'0')}-${p[1].padStart(2,'0')}`; if(p[2].length===2) return `20${p[2]}-${p[0].padStart(2,'0')}-${p[1].padStart(2,'0')}`; return s; };
     const list=[];
     up.sheets.forEach(sheet=>{
       sheet.procs.forEach(proc=>{
@@ -207,7 +207,7 @@ class Component extends DCLogic {
   computeFromLoops(rawLoops){
     if (!rawLoops?.length) return null;
     // Normalize date keys to YYYY-MM-DD regardless of original separator (- or /)
-    const normalizeDate=d=>{ const s=String(d).trim(); const p=s.split(/[-\/]/); if(p.length<3) return s; if(p[0].length===4) return `${p[0]}-${p[1].padStart(2,'0')}-${p[2].padStart(2,'0')}`; if(p[2].length===4) return `${p[2]}-${p[0].padStart(2,'0')}-${p[1].padStart(2,'0')}`; return s; };
+    const normalizeDate=d=>{ const s=String(d).trim(); const p=s.split(/[-\/]/); if(p.length<3) return s; if(p[0].length===4) return `${p[0]}-${p[1].padStart(2,'0')}-${p[2].padStart(2,'0')}`; if(p[2].length===4) return `${p[2]}-${p[0].padStart(2,'0')}-${p[1].padStart(2,'0')}`; if(p[2].length===2) return `20${p[2]}-${p[0].padStart(2,'0')}-${p[1].padStart(2,'0')}`; return s; };
     const allDatesSet = new Set();
     rawLoops.forEach(loop=>loop.dailyStatus && Object.keys(loop.dailyStatus).forEach(d=>allDatesSet.add(normalizeDate(d))));
     const sortedDates = [...allDatesSet].sort();
@@ -297,6 +297,20 @@ class Component extends DCLogic {
       });
     });
 
+    const procMonthly={};
+    teamIds.forEach(tid=>{
+      procMonthly[tid]={};
+      Object.keys(teamMap[tid]).sort().forEach(pid=>{
+        procMonthly[tid][pid]=useMonths.map(month=>{
+          const mDates=sortedDates.filter(d=>d.startsWith(month));
+          if(!mDates.length) return null;
+          const tags=teamMap[tid][pid];
+          const rates=tags.map(loop=>calcRate(Object.fromEntries(Object.entries(loop.dailyStatus||{}).map(([k,v])=>[normalizeDate(k),v])),mDates)).filter(r=>r>0);
+          return rates.length?Math.round(rates.reduce((a,r)=>a+r,0)/rates.length*10)/10:null;
+        });
+      });
+    });
+
     const changeEvents=[];
     if (prevMonth) {
       rawLoops.forEach(loop=>{
@@ -313,7 +327,7 @@ class Component extends DCLogic {
     const mNum = s => { const p=(s||'').split(/[-\/]/); const n=parseInt(p[1]); return isNaN(n)?'':n+'월'; };
     const curMonthLabel = mNum(curMonth);
     const prevMonthLabel = mNum(prevMonth);
-    return { teams, target:90, teamMonthly, overallMonthly, dailyTeam, dailyDates:last90, dailyLabels, changeEvents, monthLabels, useMonths, teamIds, curMonthLabel, prevMonthLabel };
+    return { teams, target:90, teamMonthly, overallMonthly, procMonthly, dailyTeam, dailyDates:last90, dailyLabels, changeEvents, monthLabels, useMonths, teamIds, curMonthLabel, prevMonthLabel };
   }
 
   // ===== helpers =====
@@ -378,40 +392,48 @@ class Component extends DCLogic {
     if(sc==='team'){
       const tm=this.curTeam(); if(!tm) return;
       const viewMode=this.state.teamViewMode||'monthly';
-      const allDates=D.dailyDates||D.dailyLabels;
-      let dates,procData;
-      if(viewMode==='daily'){
+      if(viewMode==='monthly'){
+        const procIds=Object.keys((D.procMonthly||{})[tm.id]||{}).sort();
+        this.mount('tmMonthLine',{
+          grid:{left:46,right:24,top:26,bottom:28},
+          legend:{top:0,left:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
+          xAxis:{type:'category',data:D.monthLabels,axisLabel:{color:'#9a9da6'},axisLine:{lineStyle:{color:grid}}},
+          yAxis:{type:'value',min:0,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
+          tooltip:{trigger:'axis',formatter:params=>{
+            const lines=params.filter(x=>x.seriesName!=='목표'&&x.value!=null).map(x=>`${x.marker}${x.seriesName}: <b>${x.value}%</b>`);
+            return `<div style="font-size:12px;line-height:1.6"><span style="font-weight:600;color:#3a3a47">${params[0]?.axisValue||''}</span><br>${lines.join('<br>')}</div>`;
+          }},
+          series:procIds.map((pid,i)=>({name:pid,type:'line',smooth:true,symbol:'circle',symbolSize:6,data:((D.procMonthly||{})[tm.id]||{})[pid]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
+            .concat([{name:'목표',type:'line',data:D.monthLabels.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
+        });
+      }else{
+        const allDates=D.dailyDates||D.dailyLabels;
         const months=D.useMonths||[];
         const selMonth=this.state.teamDailyMonth||(months.length?months[months.length-1]:'');
         const filtered=selMonth?allDates.map((d,i)=>({d,i})).filter(x=>x.d.startsWith(selMonth)):allDates.map((d,i)=>({d,i}));
-        dates=filtered.map(x=>x.d);
-        procData=(D.dailyTeam[tm.id]||[]).map(pd=>filtered.map(x=>pd[x.i]));
-      }else{
-        dates=allDates;
-        procData=(D.dailyTeam[tm.id]||[]);
+        const dates=filtered.map(x=>x.d);
+        const procData=(D.dailyTeam[tm.id]||[]).map(pd=>filtered.map(x=>pd[x.i]));
+        const tickInterval=Math.max(1,Math.ceil(dates.length/10)-1);
+        const fmtDate=val=>{ const p=String(val).split('-'); return p.length===3?`${parseInt(p[1])}/${parseInt(p[2])}`:val; };
+        this.mount('tdLine',{
+          grid:{left:46,right:24,top:26,bottom:28},
+          legend:{top:0,left:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
+          xAxis:{type:'category',data:dates,
+            axisLabel:{color:'#9a9da6',interval:tickInterval,formatter:fmtDate,rotate:dates.length>20?30:0},
+            axisLine:{lineStyle:{color:grid}},
+            axisTick:{alignWithLabel:true}},
+          yAxis:{type:'value',min:0,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
+          tooltip:{trigger:'axis',formatter:params=>{
+            const date=params[0]?.axisValue||'';
+            const p=String(date).split('-');
+            const dateStr=p.length===3?`${p[0]}년 ${parseInt(p[1])}월 ${parseInt(p[2])}일`:date;
+            const lines=params.filter(x=>x.seriesName!=='목표'&&x.value!=null).map(x=>`${x.marker}${x.seriesName}: <b>${x.value}%</b>`);
+            return `<div style="font-size:12px;line-height:1.6"><span style="font-weight:600;color:#3a3a47">${dateStr}</span><br>${lines.join('<br>')}</div>`;
+          }},
+          series:tm.processes.map((p,i)=>({name:p.name,type:'line',smooth:true,symbol:'circle',symbolSize:5,data:procData[i]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
+            .concat([{name:'목표',type:'line',data:dates.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
+        });
       }
-      const isDailyMode=viewMode==='daily';
-      const tickInterval=Math.max(1,Math.ceil(dates.length/10)-1);
-      const fmtDate=val=>{ const p=String(val).split('-'); return p.length===3?`${parseInt(p[1])}/${parseInt(p[2])}`:val; };
-      this.mount('tdLine',{
-        grid:{left:46,right:24,top:26,bottom:isDailyMode?28:44},
-        legend:{top:0,left:0,itemWidth:18,itemHeight:3,textStyle:{fontSize:11,color:'#6b6e77'}},
-        xAxis:{type:'category',data:dates,
-          axisLabel:{color:'#9a9da6',interval:tickInterval,formatter:fmtDate,rotate:dates.length>20?30:0},
-          axisLine:{lineStyle:{color:grid}},
-          axisTick:{alignWithLabel:true}},
-        yAxis:{type:'value',min:0,max:100,axisLabel:{formatter:'{value}%',color:'#9a9da6'},splitLine:{lineStyle:{color:grid}}},
-        tooltip:{trigger:'axis',formatter:params=>{
-          const date=params[0]?.axisValue||'';
-          const p=String(date).split('-');
-          const dateStr=p.length===3?`${p[0]}년 ${parseInt(p[1])}월 ${parseInt(p[2])}일`:date;
-          const lines=params.filter(x=>x.seriesName!=='목표'&&x.value!=null).map(x=>`${x.marker}${x.seriesName}: <b>${x.value}%</b>`);
-          return `<div style="font-size:12px;line-height:1.6"><span style="font-weight:600;color:#3a3a47">${dateStr}</span><br>${lines.join('<br>')}</div>`;
-        }},
-        dataZoom:isDailyMode?[]:[{type:'inside'},{type:'slider',height:16,bottom:4}],
-        series:tm.processes.map((p,i)=>({name:p.name,type:'line',smooth:true,symbol:isDailyMode?'circle':'none',symbolSize:5,data:procData[i]||[],lineStyle:{width:2,color:COLORS[i]||'#999'},itemStyle:{color:COLORS[i]||'#999'}}))
-          .concat([{name:'목표',type:'line',data:dates.map(()=>T),lineStyle:{color:red,type:'dashed',width:1.5},symbol:'none'}])
-      });
     }
     if(sc==='monthly'){
       this.mount('moLine',{
@@ -613,7 +635,7 @@ class Component extends DCLogic {
         h('table',{style:{width:'100%',borderCollapse:'collapse'}},
           h('thead',null,h('tr',null,th('공정명'),th('전체 Loop','right'),th('Auto Loop','right'),th('Auto율 ('+(D.curMonthLabel||'당월')+')','right'),th('전월 ('+(D.prevMonthLabel||'—')+')','right'),th('변동(Δ)','right'),th('상태','center'))),
           h('tbody',null,rows)));
-      const chart=h('div',{style:card({padding:'18px 20px'})},h2('공정별 일별 Auto율 추이','최근 90일'),h('div',{id:'tdLine',style:{height:'300px'}}));
+      const chart=h('div',{style:card({padding:'18px 20px'})},h2('공정별 월별 Auto율 추이'),h('div',{id:'tmMonthLine',style:{height:'280px'}}));
       return h('div',null,this.pageTitle(h,tm.name+' — Control Loop Auto율 현황'),toggleBar,table,chart);
     }
     // ── daily view ──
