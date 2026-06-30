@@ -64,7 +64,9 @@ class Component extends DCLogic {
   state = {
     screen:'overview', team:'', proc:0, modal:null, expanded:{},
     changeType:'all', changeTeam:'all', changeProc:'all', year:2026,
-    upload:null, upTeam:0, dragOver:false, regDone:false, parseErr:'',
+    adminTab:'master',
+    masterUpload:null, masterDragOver:false, masterParseErr:'', masterSaving:false, masterUpTeam:0,
+    dailyUpload:null, dailyDragOver:false, dailyParseErr:'', dailySaving:false, dailyUpTeam:0, dailySaveResult:null,
     loading:true, loadError:'', saving:false
   };
 
@@ -79,6 +81,7 @@ class Component extends DCLogic {
     try {
       const snap = await fso.getDocs(fso.collection(db, 'loops'));
       const rawLoops = snap.docs.map(d => d.data());
+      this.rawLoops = rawLoops;
       this.data = rawLoops.length ? this.computeFromLoops(rawLoops) : null;
       const expanded = {};
       const firstTeam = this.data?.teams[0];
@@ -92,57 +95,113 @@ class Component extends DCLogic {
     }
   }
 
-  async _saveLoops(loops){
-    const teams = [...new Set(loops.map(l=>l.team))];
-    // Fetch existing docs for affected teams to enable merge by (team, tagId)
-    const existingByKey = {};
-    for (const team of teams) {
-      const snap = await fso.getDocs(fso.query(fso.collection(db,'loops'), fso.where('team','==',team)));
-      snap.docs.forEach(d=>{ const dat=d.data(); existingByKey[dat.team+'::'+dat.tagId]={ref:d.ref,dailyStatus:dat.dailyStatus||{}}; });
+  // ===== Master (기준정보) =====
+  _extractMasterFromUpload(up){
+    const list=[];
+    up.sheets.forEach(sheet=>{
+      const teamId=sheet.sheet.endsWith('팀')?sheet.sheet.slice(0,-1):sheet.sheet;
+      sheet.procs.forEach(proc=>{
+        proc.rows.forEach(row=>{
+          if(!row.id) return;
+          list.push({team:teamId, proc:proc.name==='미지정'?'':proc.name, tagId:row.id, tagName:row.name||row.id, dcs:row.dcs||''});
+        });
+      });
+    });
+    return list;
+  }
+
+  async _saveMaster(masterList){
+    const teams=[...new Set(masterList.map(l=>l.team))];
+    // Preserve existing dailyStatus keyed by tagId
+    const dailyByTagId={};
+    for(const team of teams){
+      const snap=await fso.getDocs(fso.query(fso.collection(db,'loops'),fso.where('team','==',team)));
+      snap.docs.forEach(d=>{ const dat=d.data(); dailyByTagId[dat.tagId]=dat.dailyStatus||{}; });
     }
-    // Upsert: merge dailyStatus for existing tags, insert for new ones; untouched tags remain unchanged
-    for (let i=0; i<loops.length; i+=499) {
-      const batch = fso.writeBatch(db);
-      loops.slice(i,i+499).forEach(loop=>{
-        const key=loop.team+'::'+loop.tagId;
-        const existing=existingByKey[key];
-        const mergedStatus=existing?{...existing.dailyStatus,...loop.dailyStatus}:loop.dailyStatus;
-        const ref=existing?existing.ref:fso.doc(fso.collection(db,'loops'));
-        batch.set(ref, {...loop, dailyStatus:mergedStatus, updatedAt:new Date().toISOString()});
+    // Delete all existing docs for affected teams
+    for(const team of teams){
+      const snap=await fso.getDocs(fso.query(fso.collection(db,'loops'),fso.where('team','==',team)));
+      for(let i=0;i<snap.docs.length;i+=499){
+        const batch=fso.writeBatch(db);
+        snap.docs.slice(i,i+499).forEach(d=>batch.delete(d.ref));
+        await batch.commit();
+      }
+    }
+    // Re-create with preserved dailyStatus
+    for(let i=0;i<masterList.length;i+=499){
+      const batch=fso.writeBatch(db);
+      masterList.slice(i,i+499).forEach(loop=>{
+        const ref=fso.doc(fso.collection(db,'loops'));
+        batch.set(ref,{...loop, dailyStatus:dailyByTagId[loop.tagId]||{}, updatedAt:new Date().toISOString()});
       });
       await batch.commit();
     }
   }
 
-  async _registerData(){
-    if (this.state.saving) return;
-    const up = this.state.upload;
-    if (!up) return;
-    this.setState({ saving:true, parseErr:'' });
-    try {
-      const loops = this._extractLoopsFromUpload(up);
-      await this._saveLoops(loops);
-      this.setState({ loading:true });
+  async _registerMaster(){
+    const up=this.state.masterUpload;
+    if(!up||this.state.masterSaving) return;
+    this.setState({masterSaving:true, masterParseErr:''});
+    try{
+      const masterList=this._extractMasterFromUpload(up);
+      if(!masterList.length){ this.setState({masterSaving:false, masterParseErr:'등록할 Tag가 없습니다.'}); return; }
+      await this._saveMaster(masterList);
+      this.setState({loading:true});
       await this._loadData();
-      this.setState({ saving:false, upload:null });
-    } catch(e) {
-      this.setState({ saving:false, parseErr:'Firestore 저장 오류: '+e.message });
+      this.setState({masterSaving:false, masterUpload:null});
+    }catch(e){
+      this.setState({masterSaving:false, masterParseErr:'저장 오류: '+e.message});
     }
   }
 
-  _extractLoopsFromUpload(up){
-    const loops = [];
+  // ===== Daily (날짜별 데이터) =====
+  _extractDailyFromUpload(up){
+    const list=[];
     up.sheets.forEach(sheet=>{
-      const teamId = sheet.sheet.endsWith('팀') ? sheet.sheet.slice(0,-1) : sheet.sheet;
       sheet.procs.forEach(proc=>{
         proc.rows.forEach(row=>{
-          const dailyStatus = {};
-          (row.days||[]).forEach(d=>{ if(d.date && d.status) dailyStatus[d.date]=d.status; });
-          loops.push({ team:teamId, proc:proc.name==='미지정'?'':proc.name, tagId:row.id||'', tagName:row.name||row.id||'', dcs:row.dcs||'', dailyStatus });
+          if(!row.id) return;
+          const dailyStatus={};
+          // Blank cells are NOT stored — treated as 없음
+          (row.days||[]).forEach(d=>{ if(d.date&&d.status&&d.status!=='') dailyStatus[d.date]=d.status; });
+          if(Object.keys(dailyStatus).length>0) list.push({tagId:row.id, dailyStatus});
         });
       });
     });
-    return loops;
+    return list;
+  }
+
+  async _saveDailyStatus(dailyList){
+    const snap=await fso.getDocs(fso.collection(db,'loops'));
+    const existingByTagId={};
+    snap.docs.forEach(d=>{ const dat=d.data(); existingByTagId[dat.tagId]={ref:d.ref, dailyStatus:dat.dailyStatus||{}}; });
+    const matched=dailyList.filter(u=>existingByTagId[u.tagId]);
+    const unmatchedTags=dailyList.filter(u=>!existingByTagId[u.tagId]).map(u=>u.tagId);
+    for(let i=0;i<matched.length;i+=499){
+      const batch=fso.writeBatch(db);
+      matched.slice(i,i+499).forEach(u=>{
+        const ex=existingByTagId[u.tagId];
+        batch.set(ex.ref,{dailyStatus:{...ex.dailyStatus,...u.dailyStatus}, updatedAt:new Date().toISOString()},{merge:true});
+      });
+      await batch.commit();
+    }
+    return {matchedCount:matched.length, unmatchedTags};
+  }
+
+  async _registerDaily(){
+    const up=this.state.dailyUpload;
+    if(!up||this.state.dailySaving) return;
+    this.setState({dailySaving:true, dailyParseErr:'', dailySaveResult:null});
+    try{
+      const dailyList=this._extractDailyFromUpload(up);
+      if(!dailyList.length){ this.setState({dailySaving:false, dailyParseErr:'업로드 파일에 날짜 데이터가 없습니다.'}); return; }
+      const result=await this._saveDailyStatus(dailyList);
+      this.setState({loading:true});
+      await this._loadData();
+      this.setState({dailySaving:false, dailyUpload:null, dailySaveResult:result});
+    }catch(e){
+      this.setState({dailySaving:false, dailyParseErr:'저장 오류: '+e.message});
+    }
   }
 
   computeFromLoops(rawLoops){
@@ -620,31 +679,32 @@ class Component extends DCLogic {
   get VALID_STATUS(){ return ['AUT','RCAS','MAN','0','1','2']; }
   monthDates(){ const a=[]; const now=new Date(); const y=now.getFullYear(), m=String(now.getMonth()+1).padStart(2,'0'); const days=new Date(y,now.getMonth()+1,0).getDate(); for(let d=1;d<=days;d++) a.push(y+'-'+m+'-'+String(d).padStart(2,'0')); return a; }
 
-  downloadTemplate(){
-    const X=window.XLSX; if(!X){ this.setState({parseErr:'엑셀 모듈 로딩 중입니다. 잠시 후 다시 시도하세요.'}); return; }
+  downloadMasterTemplate(){
+    const X=window.XLSX; if(!X) return;
     const wb=X.utils.book_new();
-    const dates=this.monthDates();
-    const header=['공정','Tag ID','Tag Name','DCS'].concat(dates);
-    const series=(seed)=>dates.map((_,i)=>((i+seed)%7===4)?'MAN':((i+seed)%11===0?'RCAS':'AUT'));
-    const mk=(p,id,nm,dcs,seed)=>[p,id,nm,dcs].concat(series(seed));
-    const data={
-      'A팀':[mk('공정1','FIC-1001','Feed Flow','Yokogawa',0),mk('공정1','TIC-1008','Temp Ctrl','Honeywell',2),mk('공정2','PIC-2003','Press Ctrl','Yokogawa',4)],
-      'B팀':[mk('공정1','FCV-5021','Flow Valve','Honeywell',5),mk('공정2','TIC-2034','Temp Ctrl','Honeywell',2)],
-      'C팀':[mk('공정1','LIC-4005','Level Ctrl','Honeywell',1),mk('공정2','FIC-2210','Feed Flow','Yokogawa',3)],
-    };
-    Object.keys(data).forEach(team=>{
-      const ws=X.utils.aoa_to_sheet([header].concat(data[team]));
-      ws['!cols']=[{wch:8},{wch:12},{wch:14},{wch:12}].concat(dates.map(()=>({wch:11})));
-      X.utils.book_append_sheet(wb,ws,team);
-    });
-    X.writeFile(wb,'ControlLoop_데이터등록_양식.xlsx');
+    const header=['공정','Tag ID','Tag Name','DCS'];
+    const rows={'A팀':[['공정1','FIC-1001','Feed Flow','Yokogawa'],['공정1','TIC-1008','Temp Ctrl','Honeywell'],['공정2','PIC-2003','Press Ctrl','Yokogawa']],'B팀':[['공정1','FCV-5021','Flow Valve','Honeywell'],['공정2','TIC-2034','Temp Ctrl','Honeywell']],'C팀':[['공정1','LIC-4005','Level Ctrl','Honeywell'],['공정2','FIC-2210','Feed Flow','Yokogawa']]};
+    Object.keys(rows).forEach(team=>{ const ws=X.utils.aoa_to_sheet([header].concat(rows[team])); ws['!cols']=[{wch:10},{wch:14},{wch:16},{wch:12}]; X.utils.book_append_sheet(wb,ws,team); });
+    X.writeFile(wb,'ControlLoop_기준정보_양식.xlsx');
   }
 
-  triggerPick(){ if(this._fileInput) this._fileInput.click(); }
+  downloadDailyTemplate(){
+    const X=window.XLSX; if(!X) return;
+    const wb=X.utils.book_new();
+    const dates=this.monthDates();
+    const header=['Tag ID'].concat(dates);
+    const series=(seed)=>dates.map((_,i)=>((i+seed)%7===4)?'MAN':((i+seed)%11===0?'RCAS':'AUT'));
+    const rows={'A팀':[['FIC-1001'].concat(series(0)),['TIC-1008'].concat(series(2)),['PIC-2003'].concat(series(4))],'B팀':[['FCV-5021'].concat(series(5)),['TIC-2034'].concat(series(2))],'C팀':[['LIC-4005'].concat(series(1)),['FIC-2210'].concat(series(3))]};
+    Object.keys(rows).forEach(team=>{ const ws=X.utils.aoa_to_sheet([header].concat(rows[team])); ws['!cols']=[{wch:14}].concat(dates.map(()=>({wch:11}))); X.utils.book_append_sheet(wb,ws,team); });
+    X.writeFile(wb,'ControlLoop_날짜별데이터_양식.xlsx');
+  }
 
-  handleFiles(fileList){
+  triggerPick(target){ const el=target==='daily'?this._dailyFileInput:this._masterFileInput; if(el) el.click(); }
+
+  handleFiles(fileList, target){
     const file=fileList&&fileList[0]; if(!file) return;
-    const X=window.XLSX; if(!X){ this.setState({parseErr:'엑셀 모듈 로딩 중입니다.',dragOver:false}); return; }
+    const tgt=target||'master';
+    const X=window.XLSX; if(!X){ this.setState({[tgt+'ParseErr']:'엑셀 모듈 로딩 중입니다.',[tgt+'DragOver']:false}); return; }
     const rdr=new FileReader();
     rdr.onload=(e)=>{
       try{
@@ -663,9 +723,9 @@ class Component extends DCLogic {
             const autoRate=filled.length?Math.round(autoDays/filled.length*1000)/10:0;
             const badDays=days.filter(d=>!d.ok).length;
             const errs=[];
-            if(dcs&&!this.VALID_DCS.includes(dcs)) errs.push('DCS');
-            if(badDays) errs.push('상태값('+badDays+'일)');
-            if(filled.length===0) errs.push('상태 미입력');
+            if(tgt==='master'&&dcs&&!this.VALID_DCS.includes(dcs)) errs.push('DCS');
+            if(tgt==='daily'&&badDays) errs.push('상태값 오류('+badDays+'일)');
+            if(!id) errs.push('Tag ID 없음');
             const ok=errs.length===0; ok?valid++:invalid++;
             const pk=proc||'미지정';
             (procMap[pk]=procMap[pk]||[]).push({row:idx+2,id,name,dcs,days,filled:filled.length,autoDays,autoRate,badDays,ok,errs});
@@ -673,103 +733,166 @@ class Component extends DCLogic {
           return { sheet:nm, total:json.length, valid, invalid, procs:Object.keys(procMap).sort().map(k=>({name:k,rows:procMap[k]})) };
         });
         const sum=(f)=>sheets.reduce((a,s)=>a+f(s),0);
-        this.setState({ upload:{fileName:file.name,sheetCount:wb.SheetNames.length,sheetNames:wb.SheetNames,sheets,totalRows:sum(s=>s.total),totalValid:sum(s=>s.valid),totalInvalid:sum(s=>s.invalid)},upTeam:0,regDone:false,parseErr:'',dragOver:false });
-      }catch(err){ this.setState({parseErr:'파일을 읽는 중 오류가 발생했습니다: '+err.message,dragOver:false}); }
+        this.setState({[tgt+'Upload']:{fileName:file.name,sheetCount:wb.SheetNames.length,sheetNames:wb.SheetNames,sheets,totalRows:sum(s=>s.total),totalValid:sum(s=>s.valid),totalInvalid:sum(s=>s.invalid)},[tgt+'UpTeam']:0,[tgt+'ParseErr']:'',[tgt+'DragOver']:false});
+      }catch(err){ this.setState({[tgt+'ParseErr']:'파일을 읽는 중 오류가 발생했습니다: '+err.message,[tgt+'DragOver']:false}); }
     };
     rdr.readAsArrayBuffer(file);
   }
 
-  scAdmin(h,card,h2){
-    const accent=this.props.accent??'#E8390E', st=this.state, up=st.upload;
+  _uploadArea(h,card,target){
+    const st=this.state, accent=this.props.accent??'#E8390E';
+    const drag=st[target+'DragOver'], err=st[target+'ParseErr'];
+    const btn=(label,onClick,kind,disabled)=>h('button',{onClick,disabled:!!disabled,style:{display:'inline-flex',alignItems:'center',gap:'7px',border:kind==='dark'?'none':'1px solid #dfe1e6',background:kind==='dark'?(disabled?'#666':'#16161f'):'#fff',color:kind==='dark'?'#fff':'#5b5e67',padding:'9px 18px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600,cursor:disabled?'not-allowed':'pointer',fontFamily:'inherit',opacity:disabled?0.7:1}},label);
+    return h('div',{
+      onClick:()=>this.triggerPick(target),
+      onDragOver:(e)=>{e.preventDefault(); if(!drag)this.setState({[target+'DragOver']:true});},
+      onDragLeave:(e)=>{e.preventDefault(); this.setState({[target+'DragOver']:false});},
+      onDrop:(e)=>{e.preventDefault(); this.handleFiles(e.dataTransfer.files,target);},
+      style:{border:'2px dashed '+(drag?accent:'#cfd3da'),background:drag?'#fff7f4':'#fafbfc',borderRadius:'12px',padding:'40px 24px',textAlign:'center',cursor:'pointer',transition:'all .12s'}},
+      h('div',{style:{width:'48px',height:'48px',borderRadius:'12px',background:'#eef0f3',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 12px',fontSize:'22px'}},'⬆'),
+      h('div',{style:{fontSize:'14px',fontWeight:700,color:'#3a3a47',marginBottom:'4px'}},'Excel 파일을 여기에 끌어다 놓으세요'),
+      h('div',{style:{fontSize:'12px',color:'#9a9da6',marginBottom:'14px'}},'또는 클릭하여 파일 선택  ·  .xlsx, .xls'),
+      h('span',{style:{display:'inline-block',border:'1px solid #dfe1e6',background:'#fff',color:'#3a3a47',padding:'8px 18px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600}},'파일 선택'),
+      err?h('div',{style:{marginTop:'14px',color:'#FF4D4D',fontSize:'12px',fontWeight:600}},'⚠ '+err):null);
+  }
+
+  _uploadPreview(h,card,up,upTeam,target){
+    const st=this.state, accent=this.props.accent??'#E8390E';
     const th=(t,al)=>h('th',{style:{textAlign:al||'left',padding:'9px 12px',fontSize:'11px',fontWeight:700,color:'#7c7f88',background:'#fafbfc',borderBottom:'1px solid #eceef1',whiteSpace:'nowrap'}},t);
     const td=(c,extra)=>h('td',{style:Object.assign({padding:'9px 12px',fontSize:'12.5px',color:'#2b2b35',borderBottom:'1px solid #f1f2f5'},extra||{})},c);
     const btn=(label,onClick,kind,disabled)=>h('button',{onClick,disabled:!!disabled,style:{display:'inline-flex',alignItems:'center',gap:'7px',border:kind==='dark'?'none':'1px solid #dfe1e6',background:kind==='dark'?(disabled?'#666':'#16161f'):'#fff',color:kind==='dark'?'#fff':'#5b5e67',padding:'9px 18px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600,cursor:disabled?'not-allowed':'pointer',fontFamily:'inherit',opacity:disabled?0.7:1}},label);
-    const fileInput=h('input',{type:'file',accept:'.xlsx,.xls',ref:(el)=>{this._fileInput=el;},style:{display:'none'},onChange:(e)=>{ this.handleFiles(e.target.files); e.target.value=''; }});
-    const guide=h('div',{style:card({padding:'20px 22px',marginBottom:'16px'})},
-      h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'20px'}},
+    const isMaster=target==='master';
+    const saving=st[target+'Saving'];
+    const stat=(label,val,color)=>h('div',{style:{flex:'none'}},h('div',{style:{fontSize:'11px',color:'#9a9da6',marginBottom:'3px'}},label),h('div',{className:'num',style:{fontSize:'20px',fontWeight:800,color:color||'#16161f'}},val));
+    const saveLabel=saving?'저장 중...':(up.totalInvalid?(isMaster?'오류 무시하고 기준정보 저장':'오류 무시하고 날짜 저장'):(isMaster?'기준정보 저장':'날짜 데이터 저장'));
+    const summary=h('div',{style:card({padding:'16px 20px',marginBottom:'14px',display:'flex',alignItems:'center',gap:'26px'})},
+      h('div',{style:{flex:1,minWidth:0}},
+        h('div',{style:{display:'flex',alignItems:'center',gap:'9px'}},
+          h('span',{style:{fontSize:'18px'}},'📄'),
+          h('span',{style:{fontSize:'14px',fontWeight:700,color:'#16161f',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},up.fileName)),
+        h('div',{style:{fontSize:'11.5px',color:'#9a9da6',marginTop:'4px'}},'시트 '+up.sheetCount+'개 · '+up.sheetNames.join(', '))),
+      stat('총 Tag',up.totalRows), stat('정상',up.totalValid,'#52C41A'), stat('오류',up.totalInvalid,up.totalInvalid?'#FF4D4D':'#c2c5cc'),
+      h('div',{style:{display:'flex',gap:'9px'}},
+        btn('다시 업로드',()=>this.setState({[target+'Upload']:null}),'line'),
+        btn(saveLabel,()=>isMaster?this._registerMaster():this._registerDaily(),'dark',saving)));
+    const warnBanner=up.totalInvalid?h('div',{style:{display:'flex',alignItems:'center',gap:'10px',background:'#fff8e6',border:'1px solid #ffe1a8',borderLeft:'4px solid #FAAD14',borderRadius:'8px',padding:'12px 16px',marginBottom:'14px'}},
+      h('span',null,'⚠️'),h('span',{style:{fontSize:'13px',fontWeight:500,color:'#8a5a00'}},'검증 오류 '+up.totalInvalid+'행. 수정 후 재업로드하거나 정상 행만 저장할 수 있습니다.')):null;
+    const sheetTabs=h('div',{style:{display:'flex',gap:'8px',marginBottom:'14px',flexWrap:'wrap'}},
+      up.sheets.map((s,i)=>h('div',{key:i,onClick:()=>this.setState({[target+'UpTeam']:i}),style:{display:'flex',alignItems:'center',gap:'8px',padding:'8px 15px',borderRadius:'8px',cursor:'pointer',fontSize:'13px',fontWeight:600,whiteSpace:'nowrap',border:'1px solid '+(upTeam===i?'#16161f':'#dfe1e6'),background:upTeam===i?'#16161f':'#fff',color:upTeam===i?'#fff':'#5b5e67'}},
+        s.sheet,h('span',{className:'num',style:{fontSize:'11px',fontWeight:700,padding:'1px 7px',borderRadius:'9px',background:upTeam===i?'rgba(255,255,255,.18)':'#f1f2f5',color:s.invalid?(upTeam===i?'#ffb4b4':'#FF4D4D'):(upTeam===i?'#fff':'#7c7f88')}},s.invalid?(s.valid+'/'+s.total):s.total))));
+    const cur=up.sheets[upTeam]||up.sheets[0];
+    const dayColor=(d)=>!d.ok?'#c0392b':(d.status===''?'#d1d5db':(['AUT','RCAS'].includes(d.status)?'#1890FF':'#FF4D4D'));
+    const procBlocks=cur.procs.length?cur.procs.map((p,pi)=>{
+      const rows=p.rows.map((r,ri)=>h('tr',{key:ri,style:{background:r.ok?'':'#fff5f5'}},
+        td(r.row,{textAlign:'center',color:'#9a9da6',fontFamily:'Inter'}),
+        td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6'}},r.id||'—')),
+        isMaster?td(r.name||h('span',{style:{color:'#c2c5cc'}},'—')):null,
+        isMaster?td(r.dcs?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'2px 8px',borderRadius:'5px',background:r.errs.includes('DCS')?'#fdecec':this.dcsBg(r.dcs),color:r.errs.includes('DCS')?'#c0392b':this.dcsFg(r.dcs)}},r.dcs):h('span',{style:{fontSize:'11px',fontWeight:600,padding:'2px 8px',borderRadius:'5px',background:'#f1f2f5',color:'#a7aab2'}},'미지정')):null,
+        !isMaster?td(h('div',{style:{display:'flex',gap:'2px',flexWrap:'wrap',maxWidth:'400px'}},r.days.filter(d=>d.status!=='').slice(0,60).map((d,di)=>h('div',{key:di,title:d.date+' · '+d.status,style:{width:'9px',height:'15px',borderRadius:'2px',background:dayColor(d)}})))):null,
+        !isMaster?td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:this.rateColor(r.autoRate)}},r.filled?r.autoRate+'%':'—'),{textAlign:'right'}):null,
+        td(r.ok?h('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',fontSize:'12px',fontWeight:700,color:'#2e7d32'}},'✔ 정상'):h('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',fontSize:'11.5px',fontWeight:700,color:'#c0392b'}},'✘ '+r.errs.join(', ')),{textAlign:'center'})));
+      const thCols=isMaster?[th('행','center'),th('Tag ID'),th('Tag Name'),th('DCS'),th('검증','center')]:[th('행','center'),th('Tag ID'),th('날짜별 상태 (최대 60일)'),th('Auto율','right'),th('검증','center')];
+      return h('div',{key:pi,style:{marginBottom:'16px'}},
+        h('div',{style:{display:'flex',alignItems:'center',gap:'9px',margin:'0 0 8px'}},
+          h('span',{style:{fontSize:'13px',fontWeight:700,color:'#16161f'}},p.name),
+          h('span',{style:{fontSize:'11px',color:'#9a9da6'}},p.rows.length+'개 Tag')),
+        h('div',{style:card({overflow:'hidden'})},
+          h('table',{style:{width:'100%',borderCollapse:'collapse'}},
+            h('thead',null,h('tr',null,...thCols)),
+            h('tbody',null,rows))));
+    }):h('div',{style:card({padding:'40px',textAlign:'center',color:'#9a9da6',fontSize:'13px'})},'인식된 데이터 행이 없습니다.');
+    return h('div',null,summary,warnBanner,sheetTabs,h('div',null,procBlocks));
+  }
+
+  scAdmin(h,card,h2){
+    const accent=this.props.accent??'#E8390E', st=this.state;
+    const btn=(label,onClick,kind,disabled)=>h('button',{onClick,disabled:!!disabled,style:{display:'inline-flex',alignItems:'center',gap:'7px',border:kind==='dark'?'none':'1px solid #dfe1e6',background:kind==='dark'?(disabled?'#666':'#16161f'):'#fff',color:kind==='dark'?'#fff':'#5b5e67',padding:'9px 18px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600,cursor:disabled?'not-allowed':'pointer',fontFamily:'inherit',opacity:disabled?0.7:1}},label);
+    const th=(t,al)=>h('th',{style:{textAlign:al||'left',padding:'9px 12px',fontSize:'11px',fontWeight:700,color:'#7c7f88',background:'#fafbfc',borderBottom:'1px solid #eceef1',whiteSpace:'nowrap'}},t);
+    const td=(c,extra)=>h('td',{style:Object.assign({padding:'9px 12px',fontSize:'12.5px',color:'#2b2b35',borderBottom:'1px solid #f1f2f5'},extra||{})},c);
+
+    // File inputs (hidden)
+    const masterInput=h('input',{type:'file',accept:'.xlsx,.xls',ref:(el)=>{this._masterFileInput=el;},style:{display:'none'},onChange:(e)=>{ this.handleFiles(e.target.files,'master'); e.target.value=''; }});
+    const dailyInput=h('input',{type:'file',accept:'.xlsx,.xls',ref:(el)=>{this._dailyFileInput=el;},style:{display:'none'},onChange:(e)=>{ this.handleFiles(e.target.files,'daily'); e.target.value=''; }});
+
+    // Tab bar
+    const tabBar=h('div',{style:{display:'flex',gap:'4px',background:'#f1f2f5',borderRadius:'10px',padding:'4px',marginBottom:'20px',alignSelf:'flex-start'}},
+      ['master','daily'].map((key,i)=>h('div',{key,onClick:()=>this.setState({adminTab:key}),style:{padding:'8px 20px',borderRadius:'7px',fontSize:'13px',fontWeight:600,cursor:'pointer',transition:'all .1s',background:st.adminTab===key?'#fff':'transparent',color:st.adminTab===key?'#16161f':'#6b6e77',boxShadow:st.adminTab===key?'0 1px 3px rgba(0,0,0,.08)':'none'}},i===0?'기준정보 관리':'날짜별 데이터 등록')));
+
+    // ── Tab: Master ──
+    const masterTab=()=>{
+      const guide=h('div',{style:card({padding:'18px 22px',marginBottom:'16px'})},
+        h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'20px'}},
+          h('div',null,
+            h('div',{style:{fontSize:'14px',fontWeight:700,color:'#16161f',marginBottom:'6px'}},'기준정보 (Master) 업로드'),
+            h('div',{style:{fontSize:'12.5px',color:'#6b6e77',lineHeight:1.8}},
+              '• 시트명 = 팀명 (예: ',h('span',{style:{fontFamily:'Inter',fontWeight:600}},'A팀'),'), 고정 컬럼: ',h('span',{style:{fontFamily:'Inter'}},'공정 · Tag ID · Tag Name · DCS'),h('br'),
+              '• 기존 날짜별 운전 데이터는 ',h('b',null,'그대로 유지'),'됩니다.',h('br'),
+              '• DCS는 선택 항목, 공정이 없으면 "미지정"으로 분류됩니다.')),
+          btn('⬇ 기준정보 양식',()=>this.downloadMasterTemplate(),'line')),
+        h('div',{style:{display:'flex',gap:'18px',marginTop:'10px',flexWrap:'wrap'}},
+          [['공정','자유 입력'],['Tag ID','필수'],['Tag Name','자유 입력'],['DCS','Yokogawa / Honeywell (선택)']].map((c,i)=>
+            h('div',{key:i,style:{fontSize:'11.5px',color:'#9a9da6'}},h('span',{style:{fontWeight:700,color:'#7c7f88'}},c[0]),'  ',c[1]))));
+
+      if(st.masterUpload) return h('div',null,guide,this._uploadPreview(h,card,st.masterUpload,st.masterUpTeam,'master'));
+
+      // Current master table (if data exists)
+      const raw=this.rawLoops||[];
+      const sorted=[...raw].sort((a,b)=>(a.team+a.proc+a.tagId).localeCompare(b.team+b.proc+b.tagId));
+      const masterTable=sorted.length?h('div',null,
+        h('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'10px'}},
+          h('div',{style:{fontSize:'13px',fontWeight:700,color:'#16161f'}},'현재 등록된 기준정보',h('span',{className:'num',style:{fontWeight:400,color:'#9a9da6',marginLeft:'8px'}},sorted.length+'개 Tag')),
+          btn('⬆ 새 기준정보 업로드',()=>this.triggerPick('master'),'line')),
+        h('div',{style:card({overflow:'hidden',marginBottom:'8px'})},
+          h('div',{style:{overflowX:'auto'}},
+          h('table',{style:{width:'100%',borderCollapse:'collapse',minWidth:'600px'}},
+            h('thead',null,h('tr',null,th('팀'),th('공정'),th('Tag ID'),th('Tag Name'),th('DCS'),th('날짜 데이터','right'))),
+            h('tbody',null,sorted.map((loop,i)=>h('tr',{key:i,onMouseEnter:e=>e.currentTarget.style.background='#f8fafd',onMouseLeave:e=>e.currentTarget.style.background=''},
+              td(h('span',{style:{fontWeight:700}},loop.team+'팀')),
+              td(loop.proc||h('span',{style:{color:'#c2c5cc'}},'—')),
+              td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6'}},loop.tagId)),
+              td(loop.tagName||h('span',{style:{color:'#c2c5cc'}},'—')),
+              td(loop.dcs?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'2px 8px',borderRadius:'5px',background:this.dcsBg(loop.dcs),color:this.dcsFg(loop.dcs)}},loop.dcs):h('span',{style:{color:'#c2c5cc'}},'—')),
+              td(h('span',{className:'num',style:{color:'#6b6e77'}},Object.keys(loop.dailyStatus||{}).length+'일'),{textAlign:'right'}))))))))
+        :null;
+
+      return h('div',null,guide,
+        masterTable||this._uploadArea(h,card,'master'),
+        st.masterParseErr?h('div',{style:{marginTop:'10px',color:'#FF4D4D',fontSize:'12px',fontWeight:600}},'⚠ '+st.masterParseErr):null);
+    };
+
+    // ── Tab: Daily ──
+    const dailyTab=()=>{
+      const result=st.dailySaveResult;
+      const guide=h('div',{style:card({padding:'18px 22px',marginBottom:'16px'})},
+        h('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'flex-start',gap:'20px'}},
+          h('div',null,
+            h('div',{style:{fontSize:'14px',fontWeight:700,color:'#16161f',marginBottom:'6px'}},'날짜별 운전 데이터 업로드'),
+            h('div',{style:{fontSize:'12.5px',color:'#6b6e77',lineHeight:1.8}},
+              '• 시트명 = 팀명, 컬럼: ',h('span',{style:{fontFamily:'Inter'}},'Tag ID · YYYY-MM-DD · YYYY-MM-DD · …'),h('br'),
+              '• Tag ID는 ',h('b',null,'기준정보에 등록된 ID'),'와 일치해야 합니다.',h('br'),
+              '• 빈 셀은 저장되지 않으며, 해당 날짜는 ',h('b',null,'"없음"'),'으로 처리됩니다.',h('br'),
+              '• 기존 날짜 데이터는 ',h('b',null,'병합'),'됩니다 (동일 날짜는 새 값으로 덮어씁니다).')),
+          btn('⬇ 날짜 데이터 양식',()=>this.downloadDailyTemplate(),'line')),
+        h('div',{style:{display:'flex',gap:'18px',marginTop:'10px',flexWrap:'wrap'}},
+          [['Tag ID','기준정보 ID와 일치'],['날짜 컬럼','YYYY-MM-DD 형식'],['상태코드','AUT · RCAS · MAN · 0 · 1 · 2'],['빈 셀','없음으로 처리']].map((c,i)=>
+            h('div',{key:i,style:{fontSize:'11.5px',color:'#9a9da6'}},h('span',{style:{fontWeight:700,color:'#7c7f88'}},c[0]),'  ',c[1]))));
+
+      const resultBanner=result?h('div',{style:{display:'flex',alignItems:'flex-start',gap:'12px',background:result.unmatchedTags.length?'#fff8e6':'#eaf7ea',border:'1px solid '+(result.unmatchedTags.length?'#ffe1a8':'#b7e3b7'),borderLeft:'4px solid '+(result.unmatchedTags.length?'#FAAD14':'#52C41A'),borderRadius:'8px',padding:'14px 16px',marginBottom:'16px'}},
+        h('span',{style:{fontSize:'16px'}},result.unmatchedTags.length?'⚠️':'✅'),
         h('div',null,
-          h('div',{style:{fontSize:'15px',fontWeight:700,color:'#16161f',marginBottom:'8px'}},'Excel 업로드 양식'),
-          h('div',{style:{fontSize:'13px',color:'#6b6e77',lineHeight:1.7}},
-            '• 워크북은 ',h('b',null,'팀별 시트'),'로 구분합니다 — 시트명: ',h('span',{style:{fontFamily:'Inter',fontWeight:600}},'A팀 / B팀 / C팀'),h('br'),
-            '• 각 팀 시트 안에서 ',h('b',null,'공정 컬럼'),'으로 행을 구분합니다.',h('br'),
-            '• 고정 컬럼 ',h('span',{style:{fontFamily:'Inter'}},'공정 · Tag ID · Tag Name · DCS'),' 뒤로 ',h('b',null,'날짜별 상태 컬럼'),'(',h('span',{style:{fontFamily:'Inter'}},'YYYY-MM-DD'),')을 두고 상태코드를 입력합니다.',h('br'),
-            '• ',h('b',null,'DCS는 선택 항목'),'입니다 — 비워 두어도 정상 처리됩니다.')),
-        btn(h('span',null,'⬇ 양식 다운로드'),()=>this.downloadTemplate(),'line')),
-      h('div',{style:{display:'flex',gap:'18px',marginTop:'14px',flexWrap:'wrap'}},
-        [['공정','자유 입력'],['Tag ID','자유 입력'],['DCS','Yokogawa / Honeywell (선택)'],['날짜 셀 상태','AUT · RCAS · MAN · 0 · 1 · 2']].map((c,i)=>
-          h('div',{key:i,style:{fontSize:'11.5px',color:'#9a9da6'}},h('span',{style:{fontWeight:700,color:'#7c7f88'}},c[0]),'  ',c[1]))));
+          h('div',{style:{fontSize:'13px',fontWeight:600,color:result.unmatchedTags.length?'#8a5a00':'#2e7d32',marginBottom:'4px'}},'저장 완료 — '+result.matchedCount+'개 Tag 업데이트'),
+          result.unmatchedTags.length?h('div',{style:{fontSize:'12px',color:'#8a5a00'}},'기준정보 미등록 Tag '+result.unmatchedTags.length+'개 (저장 생략): ',h('span',{style:{fontFamily:'Inter',fontWeight:600}},result.unmatchedTags.slice(0,8).join(', ')+(result.unmatchedTags.length>8?' 외 '+(result.unmatchedTags.length-8)+'개':''))):null)):null;
 
-    let body;
-    if(!up){
-      body=h('div',{
-        onClick:()=>this.triggerPick(),
-        onDragOver:(e)=>{e.preventDefault(); if(!st.dragOver)this.setState({dragOver:true});},
-        onDragLeave:(e)=>{e.preventDefault(); this.setState({dragOver:false});},
-        onDrop:(e)=>{e.preventDefault(); this.handleFiles(e.dataTransfer.files);},
-        style:{border:'2px dashed '+(st.dragOver?accent:'#cfd3da'),background:st.dragOver?'#fff7f4':'#fafbfc',borderRadius:'12px',padding:'48px 24px',textAlign:'center',cursor:'pointer',transition:'all .12s'}},
-        h('div',{style:{width:'52px',height:'52px',borderRadius:'13px',background:'#eef0f3',display:'flex',alignItems:'center',justifyContent:'center',margin:'0 auto 14px',fontSize:'24px'}},'⬆'),
-        h('div',{style:{fontSize:'15px',fontWeight:700,color:'#3a3a47',marginBottom:'5px'}},'Excel 파일을 여기에 끌어다 놓으세요'),
-        h('div',{style:{fontSize:'12.5px',color:'#9a9da6',marginBottom:'16px'}},'또는 클릭하여 파일 선택  ·  .xlsx, .xls 지원'),
-        h('span',{style:{display:'inline-block',border:'1px solid #dfe1e6',background:'#fff',color:'#3a3a47',padding:'9px 20px',borderRadius:'7px',fontSize:'12.5px',fontWeight:600}},'파일 선택'),
-        st.parseErr?h('div',{style:{marginTop:'16px',color:'#FF4D4D',fontSize:'12.5px',fontWeight:600}},'⚠ '+st.parseErr):null);
-    } else {
-      const cur=up.sheets[st.upTeam]||up.sheets[0];
-      const stat=(label,val,color)=>h('div',{style:{flex:'none'}},h('div',{style:{fontSize:'11px',color:'#9a9da6',marginBottom:'3px'}},label),h('div',{className:'num',style:{fontSize:'20px',fontWeight:800,color:color||'#16161f'}},val));
-      const summary=h('div',{style:card({padding:'16px 20px',marginBottom:'14px',display:'flex',alignItems:'center',gap:'26px'})},
-        h('div',{style:{flex:1,minWidth:0}},
-          h('div',{style:{display:'flex',alignItems:'center',gap:'9px'}},
-            h('span',{style:{fontSize:'18px'}},'📄'),
-            h('span',{style:{fontSize:'14px',fontWeight:700,color:'#16161f',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},up.fileName)),
-          h('div',{style:{fontSize:'11.5px',color:'#9a9da6',marginTop:'4px'}},'시트 '+up.sheetCount+'개 · '+up.sheetNames.join(', '))),
-        stat('총 행',up.totalRows),
-        stat('정상',up.totalValid,'#52C41A'),
-        stat('오류',up.totalInvalid,up.totalInvalid?'#FF4D4D':'#c2c5cc'),
-        h('div',{style:{display:'flex',gap:'9px'}},
-          btn('다시 업로드',()=>this.setState({upload:null,regDone:false}),'line'),
-          btn(st.saving?'저장 중...':(up.totalInvalid?'오류 무시하고 병합 저장':'Firestore 병합 저장'),()=>this._registerData(),'dark',st.saving)));
-      const banner=st.regDone
-        ? h('div',{style:{display:'flex',alignItems:'center',gap:'10px',background:'#eaf7ea',border:'1px solid #b7e3b7',borderLeft:'4px solid #52C41A',borderRadius:'8px',padding:'12px 16px',marginBottom:'14px'}},
-            h('span',null,'✅'),h('span',{style:{fontSize:'13px',fontWeight:600,color:'#2e7d32'}},'병합 저장 완료. 정상 '+up.totalValid+'행이 반영되었습니다. 기존 데이터는 유지됩니다.'+(up.totalInvalid?(' (오류 '+up.totalInvalid+'행 제외)'):'')))
-        : (up.totalInvalid?h('div',{style:{display:'flex',alignItems:'center',gap:'10px',background:'#fff8e6',border:'1px solid #ffe1a8',borderLeft:'4px solid #FAAD14',borderRadius:'8px',padding:'12px 16px',marginBottom:'14px'}},
-            h('span',null,'⚠️'),h('span',{style:{fontSize:'13px',fontWeight:500,color:'#8a5a00'}},'검증 오류 '+up.totalInvalid+'행이 있습니다. 수정 후 재업로드하거나 정상 행만 저장할 수 있습니다.')):null);
-      const tabs=h('div',{style:{display:'flex',gap:'8px',marginBottom:'14px',flexWrap:'wrap'}},
-        up.sheets.map((s,i)=>h('div',{key:i,onClick:()=>this.setState({upTeam:i}),style:{display:'flex',alignItems:'center',gap:'8px',padding:'8px 15px',borderRadius:'8px',cursor:'pointer',fontSize:'13px',fontWeight:600,whiteSpace:'nowrap',border:'1px solid '+(st.upTeam===i?'#16161f':'#dfe1e6'),background:st.upTeam===i?'#16161f':'#fff',color:st.upTeam===i?'#fff':'#5b5e67'}},
-          s.sheet,
-          h('span',{className:'num',style:{fontSize:'11px',fontWeight:700,padding:'1px 7px',borderRadius:'9px',background:st.upTeam===i?'rgba(255,255,255,.18)':'#f1f2f5',color:s.invalid?(st.upTeam===i?'#ffb4b4':'#FF4D4D'):(st.upTeam===i?'#fff':'#7c7f88')}},s.invalid?(s.valid+'/'+s.total):s.total))));
-      const dayColor=(d)=>!d.ok?'#c0392b':(d.status===''?'#e5e7eb':(['AUT','RCAS'].includes(d.status)?'#1890FF':'#FF4D4D'));
-      const procBlocks=cur.procs.length?cur.procs.map((p,pi)=>{
-        const rows=p.rows.map((r,ri)=>h('tr',{key:ri,style:{background:r.ok?'':'#fff5f5'}},
-          td(r.row,{textAlign:'center',color:'#9a9da6',fontFamily:'Inter'}),
-          td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:'#1677d6'}},r.id||'—')),
-          td(r.name||h('span',{style:{color:'#c2c5cc'}},'—')),
-          td(r.dcs
-            ?h('span',{style:{fontSize:'11px',fontWeight:600,padding:'2px 8px',borderRadius:'5px',background:r.errs.includes('DCS')?'#fdecec':this.dcsBg(r.dcs),color:r.errs.includes('DCS')?'#c0392b':this.dcsFg(r.dcs)}},r.dcs)
-            :h('span',{style:{fontSize:'11px',fontWeight:600,padding:'2px 8px',borderRadius:'5px',background:'#f1f2f5',color:'#a7aab2'}},'미지정')),
-          td(h('div',{style:{display:'flex',gap:'2px',flexWrap:'wrap',maxWidth:'380px'}},r.days.map((d,di)=>h('div',{key:di,title:d.date+' · '+(d.status||'미입력'),style:{width:'9px',height:'15px',borderRadius:'2px',background:dayColor(d)}})))),
-          td(h('span',{style:{fontFamily:'Inter',fontWeight:700,color:this.rateColor(r.autoRate)}},r.filled?r.autoRate+'%':'—'),{textAlign:'right'}),
-          td(h('span',{className:'num',style:{color:'#9a9da6',fontSize:'12px'}},r.filled+'일'),{textAlign:'center'}),
-          td(r.ok
-            ?h('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',fontSize:'12px',fontWeight:700,color:'#2e7d32'}},'✔ 정상')
-            :h('span',{style:{display:'inline-flex',alignItems:'center',gap:'5px',fontSize:'11.5px',fontWeight:700,color:'#c0392b'}},'✘ '+r.errs.join(', ')),{textAlign:'center'})));
-        return h('div',{key:pi,style:{marginBottom:'16px'}},
-          h('div',{style:{display:'flex',alignItems:'center',gap:'9px',margin:'0 0 8px'}},
-            h('span',{style:{fontSize:'13px',fontWeight:700,color:'#16161f'}},p.name),
-            h('span',{style:{fontSize:'11px',color:'#9a9da6'}},p.rows.length+'개 Tag')),
-          h('div',{style:card({overflow:'hidden'})},
-            h('table',{style:{width:'100%',borderCollapse:'collapse'}},
-              h('thead',null,h('tr',null,th('행','center'),th('Tag ID'),th('Tag Name'),th('DCS'),th('일별 상태'),th('Auto율','right'),th('입력일','center'),th('검증','center'))),
-              h('tbody',null,rows))));
-      }):h('div',{style:card({padding:'40px',textAlign:'center',color:'#9a9da6',fontSize:'13px'})},'이 시트에서 인식된 데이터 행이 없습니다.');
-      body=h('div',null,summary,banner,tabs,h('div',null,procBlocks));
-    }
+      if(st.dailyUpload) return h('div',null,guide,resultBanner,this._uploadPreview(h,card,st.dailyUpload,st.dailyUpTeam,'daily'));
+      return h('div',null,guide,resultBanner,this._uploadArea(h,card,'daily'),
+        st.dailyParseErr?h('div',{style:{marginTop:'10px',color:'#FF4D4D',fontSize:'12px',fontWeight:600}},'⚠ '+st.dailyParseErr):null);
+    };
 
-    const settings=h('div',{style:{marginTop:'26px'}},
-      h('div',{style:{fontSize:'12px',fontWeight:700,color:'#9a9da6',marginBottom:'12px',letterSpacing:'.3px'}},'기타 설정'),
-      h('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}},
-        [['목표 Auto율 임계값','팀·공정별 목표/경고/위험 임계값'],['DCS 상태 코드 매핑','Yokogawa/Honeywell 코드의 Auto/MAN 인정 기준'],['Tag 마스터 관리','Tag-공정-팀 매핑 및 비활성 Tag 제외'],['알림 수신 설정','임계값 미달 시 수신 대상·채널']].map((c,i)=>
-          h('div',{key:i,style:card({padding:'15px 18px'})},h('div',{style:{fontSize:'13px',fontWeight:700,color:'#16161f',marginBottom:'4px'}},c[0]),h('div',{style:{fontSize:'12px',color:'#7c7f88',lineHeight:1.5}},c[1])))));
-
-    return h('div',null,this.pageTitle(h,'관리자 설정 · Excel 데이터 등록'),fileInput,guide,body,settings);
+    return h('div',null,
+      this.pageTitle(h,'관리자 설정'),
+      masterInput, dailyInput,
+      tabBar,
+      st.adminTab==='master'?masterTab():dailyTab());
   }
 
   // ===== layout =====
